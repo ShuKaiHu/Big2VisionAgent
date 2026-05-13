@@ -1,6 +1,11 @@
 # Big2 Vision Agent
 
-Playwright-based browser automation for playing [神來也大老二](https://www.gamesofa.com/bigtwo/#) (Gamesofa Big2). It launches a real Chromium, navigates from the lobby into a game, and drives turns through an agent interface — decoupled so you can plug in any decision model.
+Playwright-based browser automation agent for [神來也大老二](https://www.gamesofa.com/bigtwo/#) — a popular Taiwanese online Big Two card game hosted on the Gamesofa platform.
+
+> **Target game:** 神來也大老二 (`https://www.gamesofa.com/bigtwo/#`)
+> A browser-based, real-money Big Two (大老二) game built on the Cocos game engine. Players are matched into 4-player sessions; each session consists of up to 4 rounds, ending early if any player runs out of coins.
+
+This project launches a real Chromium instance, navigates from the lobby into a game, and drives turns through an agent interface — decoupled so you can plug in any decision model.
 
 ## Architecture
 
