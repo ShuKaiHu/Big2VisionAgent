@@ -2008,12 +2008,13 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
 
             loop = asyncio.get_running_loop()
             hard_deadline = loop.time() + timeout_seconds
-            games_played = 0
+            games_played = 0            # complete sessions (lobby returns); stop at games_to_play
+            game_number = 0             # individual games (局) finished within current session
             was_in_game_scene = False
             last_failed_signature = None
-            last_finish3_seq: int = -1   # highest finish3 seq already counted
-            idle_poll_count: int = 0     # counts idle polls; used to throttle finish3 checks
-            game_has_started: bool = False  # True once any player has > 0 cards this game
+            last_finish3_seq: int = -1  # highest finish3 seq already counted
+            idle_poll_count: int = 0    # counts idle polls; used to throttle finish3 checks
+            game_has_started: bool = False  # True once ≥5 cards seen this game
 
             def _any_player_emptied(state: dict) -> bool:
                 """Return True when any player's hand has dropped to 0 this game."""
@@ -2034,8 +2035,14 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 return False
 
             async def _check_finish3() -> bool:
-                """Read WS log and return True if a new finish3 event was seen."""
-                nonlocal last_finish3_seq, games_played, was_in_game_scene, last_failed_signature
+                """Read WS log; return True if a new finish3 event is detected.
+
+                finish3 signals the end of one individual game (局) within the
+                current session.  It does NOT end the session — the session only
+                ends when the Cocos scene returns to LobbyScene.  This function
+                just updates the per-session game counter for logging purposes.
+                """
+                nonlocal last_finish3_seq, last_failed_signature
                 from big2_vision_agent.browser.inspector import read_network_log as _rn
                 try:
                     entries = await _rn(page)
@@ -2050,12 +2057,9 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 if max_seq <= last_finish3_seq:
                     return False
                 last_finish3_seq = max_seq
-                games_played += 1
-                was_in_game_scene = False
                 last_failed_signature = None
                 logger.log(
-                    f"Game {games_played}/{games_to_play} completed "
-                    f"(finish3 seq={max_seq}); waiting for lobby"
+                    f"finish3 detected (seq={max_seq}); game {game_number} in session ended"
                 )
                 return True
 
@@ -2070,14 +2074,19 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 if scene == "GameScene":
                     was_in_game_scene = True
                 elif was_in_game_scene and scene == "LobbyScene":
-                    # Scene-transition path (reliable when the page navigates)
-                    if await _check_finish3():
-                        pass  # games_played already incremented inside helper
-                    else:
-                        games_played += 1
-                        was_in_game_scene = False
-                        last_failed_signature = None
-                        logger.log(f"Game {games_played}/{games_to_play} completed (scene transition)")
+                    # ── Session ended ──────────────────────────────────────────
+                    # The game only returns to lobby after all games in the
+                    # session are done OR a player went bankrupt.  Either way
+                    # this is the definitive end of one session.
+                    games_played += 1
+                    was_in_game_scene = False
+                    game_has_started = False
+                    last_failed_signature = None
+                    logger.log(
+                        f"Session {games_played}/{games_to_play} complete "
+                        f"({game_number} game(s) played; returned to lobby)"
+                    )
+                    game_number = 0
                     if games_played >= games_to_play:
                         break
 
@@ -2085,7 +2094,6 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     if scene == "LobbyScene" and games_played < games_to_play:
                         page, scene = await ensure_game_scene_from_lobby(page, logger, attempts=2)
                     elif scene not in ("LobbyScene", "GameCanvas"):
-                        # Unexpected stage — log so the user can see where we are
                         logger.log(f"Waiting for game canvas (stage={scene}, url={page.url!r})")
                     await page.wait_for_timeout(IDLE_POLL_MS)
                     continue
@@ -2093,24 +2101,37 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 state = await read_big2_game_state(page)
 
                 # Update game-started flag.
-                # Require >= 5 cards to avoid false positives from transient
-                # state reads when reconnecting to a session mid-game or just
-                # after a game ended (stale state can briefly show 1-2 cards).
-                if state.get("my_hand_count", 0) >= 5:
+                # Conditions: our hand has >= 5 cards AND all readable enemy
+                # counts are also > 0 (ensures new cards have been dealt and we
+                # are not still in the between-game scoring phase where one
+                # enemy's count is still 0 from the game just ended).
+                enemy_counts = []
+                for _ep in state.get("enemy_profiles", []):
+                    try:
+                        enemy_counts.append(int(_ep.get("remain_text", "")))
+                    except (ValueError, TypeError):
+                        pass
+                if (state.get("my_hand_count", 0) >= 5
+                        and enemy_counts
+                        and all(c > 0 for c in enemy_counts)):
                     game_has_started = True
 
-                # Primary stop condition: any player empties their hand
+                # ── Scoring phase (between games within a session) ─────────────
+                # A player emptied their hand → this individual game is over.
+                # Cards will be re-dealt for the next game automatically; we
+                # just wait for the scoring screen to clear.
+                # game_has_started will not become True again until all players
+                # have fresh cards, so this block fires exactly once per game.
                 if _any_player_emptied(state):
+                    game_number += 1
                     game_has_started = False
-                    games_played += 1
                     last_failed_signature = None
                     logger.log(
-                        f"Game {games_played}/{games_to_play} completed "
-                        f"(player emptied hand; my_count={state.get('my_hand_count')} "
-                        f"enemies={[p.get('remain_text') for p in state.get('enemy_profiles', [])]})"
+                        f"Scoring phase — game {game_number} in session ended: "
+                        f"my_count={state.get('my_hand_count')} "
+                        f"enemies={[p.get('remain_text') for p in state.get('enemy_profiles', [])]} "
+                        f"— waiting for next game or lobby return"
                     )
-                    if games_played >= games_to_play:
-                        break
                     await page.wait_for_timeout(3000)
                     continue
 
@@ -2122,11 +2143,10 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     if state.get("my_selected_count", 0) > 0:
                         logger.log("Clearing stale selection outside my actionable turn")
                         state = await clear_selected_cards(page, state, action_log, logger)
-                    # Check finish3 every ~2 s of idle time (throttled)
+                    # Check finish3 every ~2 s of idle time (throttled; for logging only)
                     idle_poll_count += 1
                     if idle_poll_count % 11 == 0:  # 11 × 180 ms ≈ 2 s
-                        if await _check_finish3() and games_played >= games_to_play:
-                            break
+                        await _check_finish3()
                     await page.wait_for_timeout(IDLE_POLL_MS)
                     continue
 
@@ -2148,23 +2168,19 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 # Check finish3 directly from the timeline we just built —
                 # this catches game-over that arrived while we were in an
                 # actionable turn, before the idle-poll throttle fires.
+                # finish3 ends an individual game (局) within the session;
+                # it does NOT end the session (lobby return does that).
                 f3_in_timeline = [e for e in timeline if e.get("type") == "finish3"]
                 if f3_in_timeline:
                     max_f3_seq = max(e.get("seq", 0) for e in f3_in_timeline)
                     if max_f3_seq > last_finish3_seq:
                         last_finish3_seq = max_f3_seq
-                        games_played += 1
-                        was_in_game_scene = False
                         last_failed_signature = None
                         logger.log(
-                            f"Game {games_played}/{games_to_play} completed "
-                            f"(finish3 in observation timeline, seq={max_f3_seq})"
+                            f"finish3 in observation timeline (seq={max_f3_seq}); "
+                            f"game {game_number} in session ended"
                         )
-                        if games_played >= games_to_play:
-                            break
-                        # Wait for the next game to start
                         await page.wait_for_timeout(3000)
-                        page, scene = await ensure_game_scene_from_lobby(page, logger, attempts=2)
                         continue
 
                 decision = agent.decide(observation)
