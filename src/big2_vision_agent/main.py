@@ -788,19 +788,20 @@ async def ensure_lobby_selector(
 
 
 async def wait_for_lobby_settings_ready(page, timeout_ms: int = 12000) -> bool:
-    """Poll until the lobby BottomPanel rule selector is readable.
+    """Poll until the lobby BottomPanel rule selector is readable *and* has text.
 
     The Cocos LobbyScene flag flips to "LobbyScene" before the BottomPanel
     finishes rendering, so a naive read of read_lobby_selector returns None on
     the first attempt and ensure_lobby_selector then bails out without setting
-    rule/amount. This helper blocks until the path resolves or we time out, so
-    the very first quick-play actually respects the configured settings."""
+    rule/amount.  Even once the node path resolves, label.string can still be
+    null for a frame or two after FB login — so we require text to be a
+    non-empty string before returning True."""
     import asyncio as _asyncio
 
     deadline = _asyncio.get_running_loop().time() + (timeout_ms / 1000)
     while _asyncio.get_running_loop().time() < deadline:
         selector = await read_lobby_selector(page, "RuleNode")
-        if selector is not None:
+        if selector is not None and selector.get("text"):
             return True
         try:
             await page.wait_for_timeout(400)
@@ -1575,13 +1576,22 @@ async def save_probe_step(output_dir: Path, page, state: dict, step: str) -> Non
 
 
 async def wait_for_game_scene(page, timeout_seconds: int = 60) -> str | None:
+    """Poll until Cocos scene becomes GameScene.
+
+    Clears lobby popups every ~5 seconds while waiting so that ads appearing
+    during matchmaking do not block the transition to GameScene."""
     deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last_popup_clear = asyncio.get_running_loop().time()
     last_scene = None
     while asyncio.get_running_loop().time() < deadline:
         page = resolve_active_page(page)
         last_scene = await safe_read_current_scene(page)
         if last_scene == "GameScene":
             return last_scene
+        now = asyncio.get_running_loop().time()
+        if now - last_popup_clear >= 5:
+            await maybe_clear_lobby_popup(page)
+            last_popup_clear = now
         try:
             await page.wait_for_timeout(1000)
         except Exception:
@@ -1593,6 +1603,9 @@ async def maybe_clear_lobby_popup(page) -> bool:
     """
     Attempt to dismiss any lobby popup.
 
+    Strategy 0: JS walk — find any active button whose label text is one of
+                the known dismiss strings (確定, OK, 關閉, …) and emit a
+                Cocos touch event on it.  Works regardless of node name.
     Strategy 1: invoke known dialog close button node names (exact match).
                 New names should be added here as they are discovered via
                 scene-dump / lobby-wait.
@@ -1603,11 +1616,102 @@ async def maybe_clear_lobby_popup(page) -> bool:
     """
     cleared = False
 
+    # --- Strategy 0: JS walk — click by label text ---
+    # Handles dialogs like 房間已滿 that have a 確定 button but no X node.
+    # Uses the same cc.Component.EventHandler.emitEvents mechanism as
+    # invoke_node (known to work), but searches by Label.string instead of
+    # node name.
+    try:
+        clicked_text = await page.evaluate("""
+        (() => {
+            const DISMISS_TEXTS = ['確定', 'OK', '關閉', 'Close', '知道了', '确定'];
+            const cc = window.cc;
+            if (!cc || !cc.director) return null;
+            const scene = cc.director.getScene();
+            if (!scene) return null;
+
+            let result = null;
+
+            function walk(node) {
+                if (result) return;
+                if (!node || !node.active) return;
+
+                // Check whether this node itself carries a dismiss label
+                const label = node.getComponent &&
+                    (node.getComponent('cc.Label') || node.getComponent(cc.Label));
+                if (label && typeof label.string === 'string' &&
+                        DISMISS_TEXTS.includes(label.string.trim())) {
+                    // Walk up ≤3 levels to find a cc.Button ancestor
+                    let candidate = node;
+                    for (let i = 0; i < 3; i++) {
+                        const btn = candidate.getComponent &&
+                            (candidate.getComponent('cc.Button') ||
+                             candidate.getComponent(cc.Button));
+                        if (btn && Array.isArray(btn.clickEvents) &&
+                                btn.clickEvents.length > 0) {
+                            // Invoke using the same path as invoke_node
+                            for (const eh of btn.clickEvents) {
+                                try {
+                                    cc.Component.EventHandler.emitEvents(
+                                        [eh], { type: 'click' }
+                                    );
+                                } catch(e) {}
+                            }
+                            result = label.string.trim();
+                            return;
+                        }
+                        if (candidate.parent) {
+                            candidate = candidate.parent;
+                        } else {
+                            break;
+                        }
+                    }
+                    // Fallback: emit on the direct parent
+                    if (!result && node.parent) {
+                        try {
+                            node.parent.emit('click');
+                            node.parent.emit('touchend');
+                            result = label.string.trim();
+                        } catch(e) {}
+                    }
+                }
+
+                for (const child of (node.children || [])) {
+                    walk(child);
+                }
+            }
+
+            walk(scene);
+            return result;
+        })()
+        """)
+        if clicked_text:
+            await asyncio.sleep(0.6)
+            cleared = True
+    except Exception:
+        pass
+
+    if cleared:
+        return cleared
+
     # --- Strategy 1: exact node names (confirmed via scene-dump) ---
     # Add new names here when new popup types are discovered.
     KNOWN_CLOSE_NODES = [
-        "dialog_close_button",   # CommonDialog family: 神幣不足, etc.
-        "CloseAreaButton",        # ADPanel ad banner close
+        "dialog_close_button",   # CommonDialog X button (神幣不足, etc.)
+        "CloseAreaButton",       # ADPanel ad banner close
+        # 確定/OK buttons for dialogs without an X (e.g. 房間已滿).
+        # These are tried in order; only the first hit is used.
+        # Exact node names to be confirmed via lobby-wait scene-dump;
+        # common Cocos naming conventions listed here as best-effort:
+        "BtnConfirm",
+        "btn_confirm",
+        "BtnOK",
+        "btn_ok",
+        "OkButton",
+        "OKButton",
+        "ConfirmButton",
+        "ButtonConfirm",
+        "ButtonOK",
     ]
     for node_name in KNOWN_CLOSE_NODES:
         if cleared:
@@ -1698,6 +1802,14 @@ async def ensure_game_scene_from_lobby(
         lobby_scene = await wait_for_scene(page, "LobbyScene", timeout_ms=30000)
         logger.log(f"enter_game attempt={attempt} wait_for_scene(LobbyScene) -> {lobby_scene}")
         if lobby_scene == "GameScene":
+            # Matchmaking placed us into a game while we were waiting.
+            # Log it but don't treat it as a clean entry — settings may not
+            # have been applied.  Accept it and move on; settings are already
+            # baked into the room at this point.
+            logger.log(
+                f"enter_game attempt={attempt} landed in GameScene via queue "
+                f"(settings from previous attempt may apply)"
+            )
             return page, lobby_scene
         popup_cleared = await maybe_clear_lobby_popup(page)
         logger.log(f"enter_game attempt={attempt} popup_cleared={popup_cleared}")
@@ -1736,6 +1848,15 @@ async def ensure_game_scene_from_lobby(
         logger.log(f"enter_game attempt={attempt} wait_for_game_scene -> {scene}")
         if scene == "GameScene":
             return page, scene
+        # Failed to enter game — clear any popup that might have appeared
+        # (e.g. "房間已滿") and wait before the next attempt.
+        if attempt < attempts:
+            popup_cleared = await maybe_clear_lobby_popup(page)
+            logger.log(
+                f"enter_game attempt={attempt} returned to {scene}; "
+                f"popup_cleared={popup_cleared}; waiting 4s before retry"
+            )
+            await asyncio.sleep(4)
     return page, scene
 
 
@@ -2012,9 +2133,11 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
             game_number = 0             # individual games (局) finished within current session
             was_in_game_scene = False
             last_failed_signature = None
+            skip_count: int = 0         # consecutive skips for current failed signature
             last_finish3_seq: int = -1  # highest finish3 seq already counted
             idle_poll_count: int = 0    # counts idle polls; used to throttle finish3 checks
             game_has_started: bool = False  # True once ≥5 cards seen this game
+            in_scoring_wait: bool = False   # True after a game ends, until fresh cards dealt
 
             def _any_player_emptied(state: dict) -> bool:
                 """Return True when any player's hand has dropped to 0 this game."""
@@ -2042,7 +2165,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 ends when the Cocos scene returns to LobbyScene.  This function
                 just updates the per-session game counter for logging purposes.
                 """
-                nonlocal last_finish3_seq, last_failed_signature
+                nonlocal last_finish3_seq, last_failed_signature, skip_count
                 from big2_vision_agent.browser.inspector import read_network_log as _rn
                 try:
                     entries = await _rn(page)
@@ -2058,6 +2181,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     return False
                 last_finish3_seq = max_seq
                 last_failed_signature = None
+                skip_count = 0
                 logger.log(
                     f"finish3 detected (seq={max_seq}); game {game_number} in session ended"
                 )
@@ -2081,7 +2205,9 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     games_played += 1
                     was_in_game_scene = False
                     game_has_started = False
+                    in_scoring_wait = False
                     last_failed_signature = None
+                    skip_count = 0
                     logger.log(
                         f"Session {games_played}/{games_to_play} complete "
                         f"({game_number} game(s) played; returned to lobby)"
@@ -2105,16 +2231,34 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 # counts are also > 0 (ensures new cards have been dealt and we
                 # are not still in the between-game scoring phase where one
                 # enemy's count is still 0 from the game just ended).
+                #
+                # While in_scoring_wait is True (after a game ended, before
+                # new cards are dealt) we require a much higher threshold —
+                # all players must have ≥ 10 cards — to confirm a fresh deal.
+                # This prevents spurious re-triggers caused by the scoring
+                # overlay changing how card counts are displayed (which can
+                # make some enemy counts temporarily unparseable so that
+                # all(c > 0) becomes vacuously true for the remaining values).
                 enemy_counts = []
                 for _ep in state.get("enemy_profiles", []):
                     try:
                         enemy_counts.append(int(_ep.get("remain_text", "")))
                     except (ValueError, TypeError):
                         pass
-                if (state.get("my_hand_count", 0) >= 5
-                        and enemy_counts
-                        and all(c > 0 for c in enemy_counts)):
-                    game_has_started = True
+                my_count = state.get("my_hand_count", 0)
+                if in_scoring_wait:
+                    # Accept "game started" only when all players clearly have
+                    # a fresh hand (≥ 10 cards each — new deal = 13 cards).
+                    if (my_count >= 10
+                            and enemy_counts
+                            and all(c >= 10 for c in enemy_counts)):
+                        in_scoring_wait = False
+                        game_has_started = True
+                else:
+                    if (my_count >= 5
+                            and enemy_counts
+                            and all(c > 0 for c in enemy_counts)):
+                        game_has_started = True
 
                 # ── Scoring phase (between games within a session) ─────────────
                 # A player emptied their hand → this individual game is over.
@@ -2125,7 +2269,9 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 if _any_player_emptied(state):
                     game_number += 1
                     game_has_started = False
+                    in_scoring_wait = True
                     last_failed_signature = None
+                    skip_count = 0
                     logger.log(
                         f"Scoring phase — game {game_number} in session ended: "
                         f"my_count={state.get('my_hand_count')} "
@@ -2176,6 +2322,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     if max_f3_seq > last_finish3_seq:
                         last_finish3_seq = max_f3_seq
                         last_failed_signature = None
+                        skip_count = 0
                         logger.log(
                             f"finish3 in observation timeline (seq={max_f3_seq}); "
                             f"game {game_number} in session ended"
@@ -2201,9 +2348,15 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     decision.combo_type,
                 )
                 if decision_signature == last_failed_signature:
-                    logger.log("Skipping repeated failed decision until state changes")
+                    skip_count += 1
+                    if skip_count == 1:
+                        logger.log("Skipping repeated failed decision until state changes")
                     await page.wait_for_timeout(IDLE_POLL_MS)
                     continue
+
+                if skip_count > 1:
+                    logger.log(f"State changed after {skip_count} skipped poll(s); resuming")
+                    skip_count = 0
 
                 (output_dir / "agent_decision.json").write_text(
                     json.dumps(decision.model_dump(), ensure_ascii=False, indent=2),
@@ -2227,7 +2380,10 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 logger.log(f"Executor result: ok={result.get('ok')} reason={result.get('reason')}")
                 if result.get("ok"):
                     last_failed_signature = None
+                    skip_count = 0
                 elif result.get("reason") in {"selection_mismatch", "play_not_confirmed"}:
+                    if decision_signature != last_failed_signature:
+                        skip_count = 0
                     last_failed_signature = decision_signature
                 if result.get("reason") == "selection_mismatch":
                     logger.log(
