@@ -29,6 +29,9 @@ from big2_vision_agent.config import Settings
 from big2_vision_agent.agent_runtime import build_decision_agent, sample_random_decision
 from big2_vision_agent.packet_state import build_agent_observation, build_live_agent_observation
 from big2_vision_agent.action_executor import _card_click_points, execute_agent_decision, execute_packet_decision
+from big2_vision_agent.decision_review import write_markdown_report
+from big2_vision_agent.session_review import write_markdown_report as write_session_review
+from big2_vision_agent.training_export import write_training_export
 from big2_vision_agent.network_parser import (
     build_sprite_card_mapping_report,
     format_turn_summary_text,
@@ -2700,6 +2703,13 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 format_turn_summary_text(turn_summary),
                 encoding="utf-8",
             )
+            review_path = write_markdown_report(output_dir)
+            session_review_path = write_session_review(output_dir)
+            training_dataset_path, training_summary_path = write_training_export(output_dir)
+            logger.log(f"Saved decision review: {review_path}")
+            logger.log(f"Saved session review: {session_review_path}")
+            logger.log(f"Saved training dataset: {training_dataset_path}")
+            logger.log(f"Saved training summary: {training_summary_path}")
             logger.log(f"Saved autoplay-agent artifacts to {output_dir}")
             print(f"Saved autoplay-agent artifacts to: {output_dir}")
             # 關閉長駐 wrapper process

@@ -5,6 +5,7 @@ __pycache__/
 playwright/.cache/
 artifacts/
 state/
+data/live_training_corpus.jsonl
 .DS_Store
 
 # --- Claude Code local settings ---
