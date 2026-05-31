@@ -421,18 +421,25 @@ def _to_decision(action_idx: int) -> dict:
 def _apply_one_card_rule(obs: dict, obs_mask: np.ndarray) -> np.ndarray:
     """Filter obs_mask to enforce the house rule:
 
-    When ANY opponent has exactly 1 card remaining, playing a single is
-    restricted to the HIGHEST single in the legal actions only.
-    Non-single plays (pair, 5-card combo, pass) are completely unrestricted.
+    When the NEXT player (下家 = the "right" seat, who plays immediately after
+    us; turn order is self → right → top → left) has exactly 1 card remaining,
+    playing a single is restricted to the HIGHEST single in the legal actions
+    only.  Non-single plays (pair, 5-card combo, pass) are completely
+    unrestricted.
 
-    This applies whether we are the lead actor OR following someone else's
-    single — the old _forced_highest_single only handled the follower case.
+    Only the right seat matters — if "left" or "top" has 1 card but "right"
+    does not, the rule is inactive and any single may be played.
 
     Returns a (possibly modified) copy of obs_mask.
     """
     opponents = obs.get("opponents", [])
-    if not any(opp.get("remaining_count") == 1 for opp in opponents):
-        return obs_mask   # Rule inactive
+    right_remaining = None
+    for opp in opponents:
+        if opp.get("seat") == "right":
+            right_remaining = opp.get("remaining_count")
+            break
+    if right_remaining != 1:
+        return obs_mask   # Rule inactive (next player does not have exactly 1 card)
 
     # Collect all single-card action indices that are currently legal
     legal_singles: list[tuple[int, int]] = []   # (card_id, action_idx)

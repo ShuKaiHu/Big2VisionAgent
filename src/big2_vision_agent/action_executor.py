@@ -74,9 +74,7 @@ def _packet_play_confirmed(before: dict, after: dict, decision: AgentDecision) -
         and after_count < before_count
     )
     targets_gone = _packet_targets_gone(before, after, decision)
-    lost_actionable_turn = _is_self_actionable_turn(before) and not _is_self_actionable_turn(after)
-    turn_changed_away = before.get("turn") == "self" and after.get("turn") not in {None, "self"}
-    return bool(hand_decreased or targets_gone or lost_actionable_turn or turn_changed_away)
+    return bool(hand_decreased or targets_gone)
 
 
 def _packet_pass_confirmed(before: dict, after: dict) -> bool:

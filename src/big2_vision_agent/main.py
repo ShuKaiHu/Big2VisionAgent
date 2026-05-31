@@ -2281,6 +2281,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
         output_dir = settings.artifact_dir / datetime.now().strftime("%Y%m%d-%H%M%S") / "autoplay_agent"
         output_dir.mkdir(parents=True, exist_ok=True)
         video_dir = output_dir / "video" if record_video else None
+        os.environ["BIG2_AGENT_DEBUG_DIR"] = str(output_dir.resolve())
         agent = build_decision_agent()
 
         async with BrowserSession(settings, record_video_dir=video_dir) as session:

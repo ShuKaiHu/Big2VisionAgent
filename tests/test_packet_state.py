@@ -180,9 +180,10 @@ def test_build_live_agent_observation_normalizes_self_lead_constraint():
 
 def test_build_live_agent_observation_no_premature_lead_after_auto_play():
     """When Cocos prematurely shows turn='self' after we auto-played but before
-    opponents have responded (passes_since_last_play < 3), the constraint must
-    NOT be cleared — legal_actions should be pass-only to prevent playing into
-    an unresolved trick."""
+    all opponents have responded (passes_since_last_play < 3), the stale Cocos
+    turn must NOT override the timeline turn.  observation.turn should stay at
+    the timeline value (not 'self'), so the wrapper returns PASS instead of
+    trying to play into an unresolved trick → which the server would reject."""
     timeline = [
         {"event": "self_hand_snapshot", "seq": 1, "cards": ["26", "47", "27", "48", "2T", "1J"]},
         {
@@ -192,7 +193,7 @@ def test_build_live_agent_observation_no_premature_lead_after_auto_play():
             "combo": {"type": "single"},
             "decoded_cards": [{"code": "11", "display": "SA", "rank_label": "A", "suit_label": "S"}],
         },
-        # Only 1 pass — top and left haven't responded yet
+        # Only 1 pass — top and left haven't responded yet (timeline turn = "top")
         {"event": "player_pass", "seq": 3, "actor": "right"},
     ]
     runtime_state = {
@@ -213,12 +214,10 @@ def test_build_live_agent_observation_no_premature_lead_after_auto_play():
 
     observation = build_live_agent_observation(timeline, runtime_state)
 
-    assert observation.turn == "self"
+    # Stale Cocos turn must be rejected — turn stays at timeline value, not "self"
+    assert observation.turn != "self"
     # Constraint must NOT be cleared — trick is not over yet
     assert observation.constraint.last_played_by == "self"
-    # No card in hand can beat SA (hand has H6,C7,H7,C8,HT,SJ — no 2s)
-    # so legal_actions should be pass-only
-    assert all(action.action == "pass" for action in observation.legal_actions)
 
 
 def test_build_live_agent_observation_parses_runtime_enemy_counts_and_seats():

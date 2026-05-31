@@ -177,10 +177,20 @@ def build_live_agent_observation(
         observation.hand_count = len(observation.self_hand)
 
     turn = runtime_state.get("turn")
-    if turn in {"self", "left", "top", "right"}:
+    stale_self_turn_after_own_play = (
+        turn == "self"
+        and observation.turn != "self"
+        and observation.constraint.last_played_by == "self"
+        and observation.constraint.passes_since_last_play < 3
+    )
+    if turn in {"self", "left", "top", "right"} and not stale_self_turn_after_own_play:
         observation.turn = turn
 
-    required_combo_type = runtime_state.get("current_required_type") or observation.constraint.required_combo_type
+    runtime_required_type = runtime_state.get("current_required_type")
+    if observation.turn == "self" and observation.constraint.required_combo_type is None:
+        required_combo_type = None
+    else:
+        required_combo_type = runtime_required_type or observation.constraint.required_combo_type
     observation.constraint.required_combo_type = required_combo_type
     _normalize_self_lead_constraint(observation)
 
@@ -238,14 +248,6 @@ def _normalize_self_lead_constraint(observation: AgentObservation) -> None:
         return
     if constraint.last_played_by != "self":
         return
-    # Only treat this as a free lead when all 3 opponents have already passed
-    # (passes_since_last_play >= 3), meaning the trick is fully resolved.
-    #
-    # Without this guard, a Cocos UI transitional state can prematurely set
-    # turn="self" after we auto-play (e.g. the opening C3 combo) while top/left
-    # have not yet responded.  That causes _build_runtime_legal_actions to return
-    # all possible plays instead of [pass], so MCTS tries to play into a round
-    # that is not yet over → server rejects with play_not_confirmed.
     if constraint.passes_since_last_play < 3:
         return
     # If runtime says it is our turn again and the last recognized play was also ours,
