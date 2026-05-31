@@ -312,6 +312,132 @@ async def invoke_node(page: Page, name: str, occurrence: int = 0, exact: bool = 
     )
 
 
+async def click_active_label_text(page: Page, labels: list[str]) -> dict:
+    return await page.evaluate(
+        """
+        ({ labels }) => {
+          const ccGlobal = window.cc;
+          const scene = ccGlobal && ccGlobal.director && ccGlobal.director.getScene
+            ? ccGlobal.director.getScene()
+            : null;
+          const view = ccGlobal && ccGlobal.view && ccGlobal.view.getDesignResolutionSize
+            ? ccGlobal.view.getDesignResolutionSize()
+            : null;
+          if (!scene || !view) {
+            return { clicked: false, reason: 'scene_unavailable' };
+          }
+
+          function readLabel(node) {
+            if (!node) return null;
+            try {
+              const label = node.getComponent && (node.getComponent('cc.Label') || node.getComponent(ccGlobal.Label));
+              return label && typeof label.string === 'string' ? label.string.trim() : null;
+            } catch (error) {
+              return null;
+            }
+          }
+
+          function worldCenter(node) {
+            if (!node || !node.getBoundingBoxToWorld) {
+              return null;
+            }
+            const box = node.getBoundingBoxToWorld();
+            return {
+              x: box.x + box.width / 2,
+              y: view.height - (box.y + box.height / 2),
+            };
+          }
+
+          function firstClickableAncestor(node) {
+            let current = node;
+            for (let depth = 0; current && depth < 5; depth += 1) {
+              try {
+                const button = current.getComponent && (current.getComponent('cc.Button') || current.getComponent(ccGlobal.Button));
+                if (button) {
+                  return current;
+                }
+              } catch (error) {}
+              current = current.parent || null;
+            }
+            return node;
+          }
+
+          function invokeNode(node) {
+            const button = node.getComponent && (node.getComponent('cc.Button') || node.getComponent(ccGlobal.Button));
+            let invoked = false;
+            let mode = 'none';
+
+            if (button && Array.isArray(button.clickEvents) && button.clickEvents.length > 0) {
+              try {
+                for (const eventHandler of button.clickEvents) {
+                  ccGlobal.Component && ccGlobal.Component.EventHandler.emitEvents([eventHandler], { type: 'click' });
+                }
+                invoked = true;
+                mode = 'clickEvents';
+              } catch (error) {}
+            }
+
+            if (!invoked) {
+              try {
+                node.emit('click');
+                node.emit('touchend');
+                invoked = true;
+                mode = 'emit';
+              } catch (error) {}
+            }
+
+            return { invoked, mode };
+          }
+
+          let match = null;
+          function visit(node) {
+            if (match || !node || !node.activeInHierarchy) {
+              return;
+            }
+            const ownText = readLabel(node);
+            if (ownText && labels.includes(ownText)) {
+              match = node;
+              return;
+            }
+            const children = Array.isArray(node.children) ? node.children : [];
+            for (const child of children) {
+              const childText = readLabel(child);
+              if (child.activeInHierarchy && childText && labels.includes(childText)) {
+                match = firstClickableAncestor(child);
+                return;
+              }
+            }
+            for (const child of children) {
+              visit(child);
+              if (match) return;
+            }
+          }
+
+          visit(scene);
+          if (!match) {
+            return { clicked: false, reason: 'label_not_found', labels };
+          }
+
+          const text = readLabel(match) || labels.find((label) => {
+            const children = Array.isArray(match.children) ? match.children : [];
+            return children.some((child) => readLabel(child) === label);
+          }) || null;
+          const center = worldCenter(match);
+          const invoke = invokeNode(match);
+          return {
+            clicked: Boolean(invoke.invoked),
+            reason: invoke.invoked ? null : 'invoke_failed',
+            text,
+            center,
+            mode: invoke.mode,
+            node_name: match.name || null,
+          };
+        }
+        """,
+        {"labels": labels},
+    )
+
+
 async def toggle_my_card_by_sprite(page: Page, sprite_frame: str) -> dict:
     return await page.evaluate(
         """

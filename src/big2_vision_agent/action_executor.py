@@ -4,6 +4,8 @@ from big2_vision_agent.agent_schema import AgentActionOption, AgentDecision
 from big2_vision_agent.browser.actions import click_design_point, read_big2_game_state, toggle_my_card_by_sprite, ws_send_raw
 
 WS_SEND_TARGET_CODE = "9"
+PACKET_CONFIRM_DELAYS_MS = (350, 500, 700, 900, 1200)
+PACKET_REJECTION_MESSAGE_KEYS = ("card_type_error", "no_bigger_card", "cant_lock")
 
 COMBO_BUTTON_KEYS = {
     "single": "single",
@@ -30,6 +32,87 @@ class ActionExecutor:
         if pass_actions:
             return AgentDecision(action="pass", note="fallback:pass")
         return None
+
+
+def _is_self_actionable_turn(state: dict) -> bool:
+    if state.get("turn") != "self":
+        return False
+    if not state.get("my_clock_active"):
+        return False
+    action_buttons = state.get("action_buttons", {})
+    pass_button = action_buttons.get("pass", {})
+    play_button = action_buttons.get("play", {})
+    return bool(pass_button.get("active") or play_button.get("active"))
+
+
+def _hand_sprite_codes(state: dict) -> set[str]:
+    return {
+        str(card.get("sprite_frame"))
+        for card in state.get("my_cards", [])
+        if isinstance(card.get("sprite_frame"), str)
+    }
+
+
+def _packet_targets_gone(before: dict, after: dict, decision: AgentDecision) -> bool:
+    before_codes = _hand_sprite_codes(before)
+    after_codes = _hand_sprite_codes(after)
+    targets = {f"c{code}" for code in decision.card_codes}
+    if not targets:
+        return False
+    if not targets & before_codes:
+        return False
+    return not (targets & after_codes)
+
+
+def _packet_play_confirmed(before: dict, after: dict, decision: AgentDecision) -> bool:
+    before_count = before.get("my_hand_count")
+    after_count = after.get("my_hand_count")
+    hand_decreased = (
+        isinstance(before_count, int)
+        and isinstance(after_count, int)
+        and after_count < before_count
+    )
+    targets_gone = _packet_targets_gone(before, after, decision)
+    lost_actionable_turn = _is_self_actionable_turn(before) and not _is_self_actionable_turn(after)
+    turn_changed_away = before.get("turn") == "self" and after.get("turn") not in {None, "self"}
+    return bool(hand_decreased or targets_gone or lost_actionable_turn or turn_changed_away)
+
+
+def _packet_pass_confirmed(before: dict, after: dict) -> bool:
+    turn_changed = after.get("turn") != before.get("turn")
+    lost_actionable_turn = _is_self_actionable_turn(before) and not _is_self_actionable_turn(after)
+    table_cleared = (
+        isinstance(before.get("visible_table_card_count"), int)
+        and isinstance(after.get("visible_table_card_count"), int)
+        and after.get("visible_table_card_count") < before.get("visible_table_card_count")
+    )
+    return bool(turn_changed or lost_actionable_turn or table_cleared)
+
+
+def _packet_rejection_reason(before: dict, after: dict) -> str | None:
+    before_messages = before.get("system_messages") or {}
+    after_messages = after.get("system_messages") or {}
+    for key in PACKET_REJECTION_MESSAGE_KEYS:
+        if after_messages.get(key) and not before_messages.get(key):
+            return f"play_rejected_{key}"
+    return None
+
+
+def _compact_packet_confirmation_state(state: dict, decision: AgentDecision | None = None) -> dict[str, object]:
+    targets = {f"c{code}" for code in decision.card_codes} if decision else set()
+    hand_codes = _hand_sprite_codes(state)
+    return {
+        "turn": state.get("turn"),
+        "my_clock_active": state.get("my_clock_active"),
+        "my_hand_count": state.get("my_hand_count"),
+        "my_selected_count": state.get("my_selected_count"),
+        "self_actionable": _is_self_actionable_turn(state),
+        "target_cards_present": sorted(targets & hand_codes),
+        "system_messages": {
+            key: bool((state.get("system_messages") or {}).get(key))
+            for key in PACKET_REJECTION_MESSAGE_KEYS
+        },
+    }
 
 
 async def _clear_selected_cards(page, state: dict) -> dict:
@@ -307,65 +390,95 @@ async def execute_packet_decision(
       pass  → "pass"
     """
     if decision.action == "pass":
+        preflight = await read_big2_game_state(page)
+        confirmation_states = [_compact_packet_confirmation_state(preflight)]
+        if not _is_self_actionable_turn(preflight):
+            return {
+                "ok": False,
+                "sent": False,
+                "reason": "state_changed_before_send",
+                "action": "pass",
+                "state": preflight,
+                "state_before": preflight,
+                "confirmation_states": confirmation_states,
+            }
         ok = await ws_send_raw(page, "pass")
         if not ok:
-            return {"ok": False, "reason": "ws_unavailable", "action": "pass"}
-        await page.wait_for_timeout(800)
-        after = await read_big2_game_state(page)
-        turn_changed = after.get("turn") != state.get("turn")
-        if not turn_changed:
-            await page.wait_for_timeout(800)
+            return {"ok": False, "sent": False, "reason": "ws_unavailable", "action": "pass"}
+        after = preflight
+        confirmed = False
+        for delay_ms in PACKET_CONFIRM_DELAYS_MS:
+            await page.wait_for_timeout(delay_ms)
             after = await read_big2_game_state(page)
-            turn_changed = after.get("turn") != state.get("turn")
+            confirmation_states.append(_compact_packet_confirmation_state(after))
+            confirmed = _packet_pass_confirmed(preflight, after)
+            if confirmed:
+                break
         return {
-            "ok": turn_changed,
+            "ok": confirmed,
+            "sent": True,
             "action": "pass",
-            "reason": None if turn_changed else "pass_not_confirmed",
+            "reason": None if confirmed else "pass_confirmation_timeout",
             "state": after,
+            "state_before": preflight,
+            "confirmation_states": confirmation_states,
         }
 
     cards_blob = "".join(decision.card_codes)
     message = f"send {WS_SEND_TARGET_CODE} {cards_blob}"
+    preflight = await read_big2_game_state(page)
+    confirmation_states = [_compact_packet_confirmation_state(preflight, decision)]
+    if not _is_self_actionable_turn(preflight):
+        return {
+            "ok": False,
+            "sent": False,
+            "reason": "state_changed_before_send",
+            "action": "play",
+            "card_codes": decision.card_codes,
+            "ws_message": message,
+            "state": preflight,
+            "state_before": preflight,
+            "confirmation_states": confirmation_states,
+        }
     ok = await ws_send_raw(page, message)
     if not ok:
         return {
             "ok": False,
+            "sent": False,
             "reason": "ws_unavailable",
             "action": "play",
             "card_codes": decision.card_codes,
         }
 
-    await page.wait_for_timeout(800)
-    after = await read_big2_game_state(page)
-    before_count = state.get("my_hand_count")
-    after_count = after.get("my_hand_count")
-    turn_changed = after.get("turn") != state.get("turn")
-    hand_decreased = (
-        isinstance(before_count, int)
-        and isinstance(after_count, int)
-        and after_count < before_count
-    )
-    if not hand_decreased and not turn_changed:
-        await page.wait_for_timeout(800)
+    after = preflight
+    rejection_reason: str | None = None
+    for delay_ms in PACKET_CONFIRM_DELAYS_MS:
+        await page.wait_for_timeout(delay_ms)
         after = await read_big2_game_state(page)
-        after_count = after.get("my_hand_count")
-        turn_changed = after.get("turn") != state.get("turn")
-        hand_decreased = (
-            isinstance(before_count, int)
-            and isinstance(after_count, int)
-            and after_count < before_count
-        )
-    system_messages = after.get("system_messages") or {}
-    blocked_by_error = any(
-        system_messages.get(key)
-        for key in ("card_type_error", "no_bigger_card", "cant_lock")
-    )
-    play_ok = bool(hand_decreased or (turn_changed and not blocked_by_error))
+        confirmation_states.append(_compact_packet_confirmation_state(after, decision))
+        if _packet_play_confirmed(preflight, after, decision):
+            return {
+                "ok": True,
+                "sent": True,
+                "action": "play",
+                "card_codes": decision.card_codes,
+                "ws_message": message,
+                "reason": None,
+                "state": after,
+                "state_before": preflight,
+                "confirmation_states": confirmation_states,
+            }
+        rejection_reason = _packet_rejection_reason(preflight, after)
+        if rejection_reason:
+            break
     return {
-        "ok": play_ok,
+        "ok": False,
+        "sent": True,
         "action": "play",
         "card_codes": decision.card_codes,
         "ws_message": message,
-        "reason": None if play_ok else "play_not_confirmed",
+        "reason": rejection_reason or "play_confirmation_timeout",
         "state": after,
+        "state_before": preflight,
+        "confirmation_states": confirmation_states,
     }

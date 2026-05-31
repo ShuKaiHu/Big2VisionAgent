@@ -789,6 +789,20 @@ def _apply_relative_seat_labels(events: list[dict[str, object]]) -> None:
         actor_index = event.get("actor_index")
         if isinstance(actor_index, str):
             event["actor"] = seat_map.get(actor_index, actor_index)
+        if event.get("event") == "room_snapshot":
+            players = event.get("players")
+            event["self_index"] = self_index
+            if isinstance(players, list):
+                annotated_players = []
+                for seat_index, player in enumerate(players):
+                    if not isinstance(player, dict):
+                        annotated_players.append(player)
+                        continue
+                    annotated = dict(player)
+                    annotated["seat_index"] = seat_index
+                    annotated["actor"] = seat_map.get(str(seat_index), str(seat_index))
+                    annotated_players.append(annotated)
+                event["players"] = annotated_players
         if event.get("event") == "hand_snapshot":
             event["event"] = "self_hand_snapshot"
             event["actor"] = "self"

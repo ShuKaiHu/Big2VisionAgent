@@ -188,8 +188,10 @@ def build_live_agent_observation(
     if enemy_profiles:
         remaining_by_seat = {}
         for enemy in enemy_profiles:
-            seat = enemy.get("seat")
+            seat = enemy.get("seat") or _infer_enemy_seat(enemy.get("center") or {})
             count = enemy.get("remaining_count")
+            if not isinstance(count, int):
+                count = _parse_remaining_count(enemy.get("remain_text"))
             if seat in {"left", "top", "right"}:
                 remaining_by_seat[seat] = count
         observation.opponents = [
@@ -203,8 +205,31 @@ def build_live_agent_observation(
         observation.self_hand,
         observation.constraint.required_combo_type,
         observation.constraint.last_played_cards,
+        observation.opponents,
     )
     return observation
+
+
+def _parse_remaining_count(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value.isdigit():
+        return None
+    return int(value)
+
+
+def _infer_enemy_seat(center: dict[str, object]) -> str | None:
+    x = center.get("x")
+    if not isinstance(x, (int, float)):
+        return None
+    if x < 500:
+        return "left"
+    if x > 1200:
+        return "right"
+    return "top"
 
 
 def _normalize_self_lead_constraint(observation: AgentObservation) -> None:
@@ -249,9 +274,11 @@ def _build_runtime_legal_actions(
     hand_cards: list[AgentCard],
     required_combo_type: str | None,
     last_played_cards: list[AgentCard],
+    opponents: list[OpponentState] | None = None,
 ) -> list[AgentActionOption]:
     allow_pass = bool(runtime_state.get("action_buttons", {}).get("pass", {}).get("active"))
     actions = _build_legal_actions(hand_cards, required_combo_type, last_played_cards, allow_pass=allow_pass)
+    actions = _filter_right_one_single_rule(actions, opponents)
     playable_indexes = list(runtime_state.get("my_playable_indexes") or [])
 
     if required_combo_type is not None and not playable_indexes:
@@ -273,7 +300,44 @@ def _build_runtime_legal_actions(
             continue
         if all(card.code in playable_codes for card in action.cards):
             filtered.append(action)
-    return filtered
+    return _filter_right_one_single_rule(filtered, opponents)
+
+
+def _right_opponent_has_one_card(opponents: list[OpponentState] | None) -> bool:
+    for opponent in opponents or []:
+        if opponent.seat == "right" and opponent.remaining_count == 1:
+            return True
+    return False
+
+
+def _filter_right_one_single_rule(
+    actions: list[AgentActionOption],
+    opponents: list[OpponentState] | None,
+) -> list[AgentActionOption]:
+    """When next player has one card, single-card plays must use our highest single."""
+    if not _right_opponent_has_one_card(opponents):
+        return actions
+
+    single_actions = [
+        action
+        for action in actions
+        if action.action == "play" and action.combo_type == "single" and len(action.cards) == 1
+    ]
+    if len(single_actions) <= 1:
+        return actions
+
+    max_single = max(single_actions, key=lambda action: _combo_signature(action.cards, "single"))
+    max_code = max_single.cards[0].code
+    return [
+        action
+        for action in actions
+        if not (
+            action.action == "play"
+            and action.combo_type == "single"
+            and len(action.cards) == 1
+            and action.cards[0].code != max_code
+        )
+    ]
 
 
 def _build_legal_actions(

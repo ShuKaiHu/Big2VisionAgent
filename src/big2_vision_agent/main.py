@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from big2_vision_agent.browser.actions import (
+    click_active_label_text,
     click_named_node,
     click_canvas_design_position,
     click_design_point,
@@ -28,6 +29,9 @@ from big2_vision_agent.config import Settings
 from big2_vision_agent.agent_runtime import build_decision_agent, sample_random_decision
 from big2_vision_agent.packet_state import build_agent_observation, build_live_agent_observation
 from big2_vision_agent.action_executor import _card_click_points, execute_agent_decision, execute_packet_decision
+from big2_vision_agent.decision_review import write_markdown_report
+from big2_vision_agent.session_review import write_markdown_report as write_session_review
+from big2_vision_agent.training_export import write_training_export
 from big2_vision_agent.network_parser import (
     build_sprite_card_mapping_report,
     format_turn_summary_text,
@@ -36,17 +40,20 @@ from big2_vision_agent.network_parser import (
     parse_network_entries,
     summarize_turns,
 )
+from big2_vision_agent.ml_state import build_ml_state
 
 DEFAULT_QUICK_PLAY_X = 885.0
 DEFAULT_QUICK_PLAY_Y = 948.0
 DEFAULT_POPUP_CONFIRM_X = 864.0
 DEFAULT_POPUP_CONFIRM_Y = 741.0
+DEFAULT_AD_CLOSE_X = 1758.0
+DEFAULT_AD_CLOSE_Y = 76.0
 DEFAULT_EVENT_CLOSE_X = 1655.0
 DEFAULT_EVENT_CLOSE_Y = 96.0
 DEFAULT_MODAL_CLOSE_X = 1308.0
 DEFAULT_MODAL_CLOSE_Y = 257.0
 DEFAULT_AMOUNT_TARGET = "10元"
-DEFAULT_RULE_TARGET = "不換牌"
+DEFAULT_RULE_TARGET = "正常局"
 IDLE_POLL_MS = 180
 POST_ACTION_WAIT_MS = 220
 
@@ -318,6 +325,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build an agent-ready observation from a saved network_log.json.",
     )
     observation_parser.add_argument(
+        "--path",
+        type=Path,
+        required=True,
+        help="Path to network_log.json",
+    )
+    ml_state_parser = subparsers.add_parser(
+        "build-ml-state",
+        help="Build an ML-ready game state from a saved network_log.json.",
+    )
+    ml_state_parser.add_argument(
         "--path",
         type=Path,
         required=True,
@@ -615,6 +632,37 @@ def maybe_record_turn_event(
         logger.log(f"Turn event: {previous_turn} passed")
 
 
+async def maybe_click_score_no(
+    page,
+    logger: RunLogger | None = None,
+    action_log: list[dict[str, object]] | None = None,
+) -> bool:
+    try:
+        result = await click_active_label_text(page, ["否", "No"])
+    except Exception as exc:
+        if logger is not None:
+            logger.log(f"Score dialog dismiss probe failed: {exc}")
+        return False
+
+    if not result.get("clicked"):
+        return False
+
+    if logger is not None:
+        logger.log(
+            "Dismissed score dialog: "
+            f"text={result.get('text')!r} mode={result.get('mode')} node={result.get('node_name')!r}"
+        )
+    if action_log is not None:
+        action_log.append(
+            {
+                "step": "click_score_no",
+                "result": result,
+            }
+        )
+    await page.wait_for_timeout(800)
+    return True
+
+
 async def read_lobby_selector(page, node_name: str) -> dict | None:
     return await page.evaluate(
         """
@@ -844,8 +892,8 @@ async def ensure_normal_rule(page, max_attempts: int = 12) -> str | None:
 
     Order of preference:
       1. Exact match for DEFAULT_RULE_TARGET (so user can override).
-      2. Any option whose label contains "不換".
-      3. Any option whose label contains "正常" (game's no-swap variant).
+      2. Any option whose label contains "正常" (game's no-swap variant).
+      3. Any option whose label contains "不換".
       4. Whatever the cycle landed on last as a final fallback.
     """
     if not await wait_for_lobby_settings_ready(page):
@@ -860,18 +908,24 @@ async def ensure_normal_rule(page, max_attempts: int = 12) -> str | None:
         target = DEFAULT_RULE_TARGET
     if target is None:
         for opt in options:
-            if "不換" in opt:
+            if "正常" in opt:
                 target = opt
                 break
     if target is None:
         for opt in options:
-            if "正常" in opt:
+            if "不換" in opt:
                 target = opt
                 break
     if target is None:
         target = options[-1]
 
     return await ensure_lobby_selector(page, "RuleNode", target, max_attempts=max_attempts * 2)
+
+
+def is_normal_rule_text(rule_text: str | None) -> bool:
+    if not rule_text:
+        return False
+    return ("正常" in rule_text) or ("不換" in rule_text)
 
 
 async def ensure_min_amount(page, max_attempts: int = 12) -> str | None:
@@ -1327,11 +1381,16 @@ async def run_parse_network_log(path: Path) -> None:
     turn_summary_path = path.with_name("turn_summary.json")
     turn_summary_text_path = path.with_name("turn_summary.txt")
     sprite_mapping_path = path.with_name("sprite_card_mapping.json")
+    ml_state_path = path.with_name("ml_state.json")
     output_path.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
     timeline_path.write_text(json.dumps(timeline, ensure_ascii=False, indent=2), encoding="utf-8")
     turn_summary = summarize_turns(timeline)
     turn_summary_path.write_text(json.dumps(turn_summary, ensure_ascii=False, indent=2), encoding="utf-8")
     turn_summary_text_path.write_text(format_turn_summary_text(turn_summary), encoding="utf-8")
+    ml_state_path.write_text(
+        json.dumps(build_ml_state(timeline), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     action_log_path = path.with_name("action_log.json")
     if action_log_path.exists():
         action_log = json.loads(action_log_path.read_text(encoding="utf-8"))
@@ -1346,6 +1405,7 @@ async def run_parse_network_log(path: Path) -> None:
     print(f"Saved game timeline to: {timeline_path}")
     print(f"Saved turn summary to: {turn_summary_path}")
     print(f"Saved readable turn summary to: {turn_summary_text_path}")
+    print(f"Saved ML state to: {ml_state_path}")
     if action_log_path.exists():
         print(f"Saved sprite mapping to: {sprite_mapping_path}")
 
@@ -1359,6 +1419,17 @@ async def run_build_agent_observation(path: Path) -> None:
         encoding="utf-8",
     )
     print(f"Saved agent observation to: {output_path}")
+
+
+async def run_build_ml_state(path: Path) -> None:
+    _, timeline = load_parse_and_build_timeline(path)
+    ml_state = build_ml_state(timeline)
+    output_path = path.with_name("ml_state.json")
+    output_path.write_text(
+        json.dumps(ml_state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Saved ML state to: {output_path}")
 
 
 async def run_build_agent_decision(path: Path, mode: str) -> None:
@@ -1588,6 +1659,7 @@ async def wait_for_game_scene(page, timeout_seconds: int = 60) -> str | None:
         last_scene = await safe_read_current_scene(page)
         if last_scene == "GameScene":
             return last_scene
+        await maybe_start_room_match(page)
         now = asyncio.get_running_loop().time()
         if now - last_popup_clear >= 5:
             await maybe_clear_lobby_popup(page)
@@ -1609,12 +1681,72 @@ async def maybe_clear_lobby_popup(page) -> bool:
     Strategy 1: invoke known dialog close button node names (exact match).
                 New names should be added here as they are discovered via
                 scene-dump / lobby-wait.
-    Strategy 2: broad partial-name scan for active close-button-style nodes;
+    Strategy 2: right-top hotspot scan for active small close controls.
+                This targets ad panels like the screenshoted event banner:
+                click the top-right red X and avoid the mid-right reward orb.
+    Strategy 3: broad partial-name scan for active close-button-style nodes;
                 picks the candidate closest to the top-right corner of the
                 canvas (most likely a popup X, not a settings-panel button).
-    Strategy 3: coordinate-based fallback for event banners / modal dialogs.
+    Strategy 4: coordinate-based fallback for event banners / modal dialogs.
     """
     cleared = False
+
+    # --- Strategy -1: DOM/HTML modal close ---
+    # Some new ads/prompts are plain DOM overlays rather than Cocos nodes.
+    try:
+        dom_cleared = await page.evaluate("""
+        (() => {
+            const dismissTexts = ['關閉', 'Close', '確定', 'OK', '知道了', '略過', '跳過', '取消', '否'];
+            const selectors = [
+              '[aria-label="Close"]',
+              '[aria-label="close"]',
+              '[data-testid="close"]',
+              '.close',
+              '.btn-close',
+              '.modal-close',
+              '.popup-close',
+              '#easyDialogBox .close',
+              '#easyDialogBox button',
+              '#easyDialogBox a',
+              '#overlay',
+            ];
+
+            function visible(el) {
+              if (!el) return false;
+              const style = window.getComputedStyle(el);
+              if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+              const rect = el.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            }
+
+            for (const selector of selectors) {
+              for (const el of document.querySelectorAll(selector)) {
+                if (!visible(el)) continue;
+                try {
+                  el.click();
+                  return { clicked: true, selector };
+                } catch (error) {}
+              }
+            }
+
+            const candidates = Array.from(document.querySelectorAll('button, a, div, span'));
+            for (const el of candidates) {
+              if (!visible(el)) continue;
+              const text = (el.textContent || '').trim();
+              if (!dismissTexts.includes(text)) continue;
+              try {
+                el.click();
+                return { clicked: true, text };
+              } catch (error) {}
+            }
+            return { clicked: false };
+        })()
+        """)
+        if dom_cleared and dom_cleared.get("clicked"):
+            await asyncio.sleep(0.6)
+            cleared = True
+    except Exception:
+        pass
 
     # --- Strategy 0: JS walk — click by label text ---
     # Handles dialogs like 房間已滿 that have a 確定 button but no X node.
@@ -1727,7 +1859,114 @@ async def maybe_clear_lobby_popup(page) -> bool:
     if cleared:
         return cleared
 
-    # --- Strategy 2: broad partial-name scan, most-top-right active node ---
+    # --- Strategy 2: top-right small clickable hotspot ---
+    # Event ads can use generic node names, but the close affordance is still a
+    # small clickable widget in the extreme top-right. Restrict the search to
+    # that hotspot so we do not hit the large mid-right reward button.
+    overlay_close_probe = None
+    try:
+        overlay_close_probe = await page.evaluate(
+            """
+            (() => {
+              const ccGlobal = window.cc;
+              const scene = ccGlobal && ccGlobal.director && ccGlobal.director.getScene
+                ? ccGlobal.director.getScene()
+                : null;
+              const view = ccGlobal && ccGlobal.view && ccGlobal.view.getDesignResolutionSize
+                ? ccGlobal.view.getDesignResolutionSize()
+                : null;
+              if (!scene || !view) {
+                return null;
+              }
+
+              function rect(node) {
+                if (!node || !node.getBoundingBoxToWorld) return null;
+                try {
+                  const box = node.getBoundingBoxToWorld();
+                  return {
+                    x: box.x,
+                    y: box.y,
+                    width: box.width,
+                    height: box.height,
+                    centerX: box.x + box.width / 2,
+                    centerYTop: view.height - (box.y + box.height / 2),
+                  };
+                } catch (error) {
+                  return null;
+                }
+              }
+
+              function isClickable(node) {
+                if (!node) return false;
+                try {
+                  const button = node.getComponent && (node.getComponent('cc.Button') || node.getComponent(ccGlobal.Button));
+                  if (button) return true;
+                } catch (error) {}
+                try {
+                  return (node._components || []).some((component) => Array.isArray(component && component.clickEvents) && component.clickEvents.length > 0);
+                } catch (error) {
+                  return false;
+                }
+              }
+
+              const candidates = [];
+              let overlayDetected = false;
+              function visit(node, path) {
+                if (!node || !node.activeInHierarchy) return;
+                const nextPath = [...path, node.name || ''];
+                const box = rect(node);
+                if (box) {
+                  const largeCenteredPanel =
+                    box.width * box.height >= view.width * view.height * 0.18 &&
+                    box.centerX >= view.width * 0.22 &&
+                    box.centerX <= view.width * 0.78 &&
+                    box.centerYTop >= view.height * 0.12 &&
+                    box.centerYTop <= view.height * 0.88;
+                  if (largeCenteredPanel) {
+                    overlayDetected = true;
+                  }
+                  const inHotspot = box.centerX >= view.width * 0.88 && box.centerYTop <= view.height * 0.18;
+                  const sensibleSize = box.width >= 12 && box.height >= 12 && box.width <= 220 && box.height <= 220;
+                  if (inHotspot && sensibleSize && isClickable(node)) {
+                    candidates.push({
+                      path: nextPath.join(' / '),
+                      name: node.name || '',
+                      x: box.centerX,
+                      y: box.centerYTop,
+                      area: box.width * box.height,
+                      score: (view.width - box.centerX) * 1.5 + box.centerYTop + (box.width * box.height) / 1200,
+                    });
+                  }
+                }
+                for (const child of (node.children || [])) {
+                  visit(child, nextPath);
+                }
+              }
+
+              visit(scene, []);
+              if (!overlayDetected) {
+                return { overlayDetected: false, candidate: null };
+              }
+              if (!candidates.length) {
+                return { overlayDetected: true, candidate: null };
+              }
+              candidates.sort((a, b) => a.score - b.score);
+              return { overlayDetected: true, candidate: candidates[0] };
+            })()
+            """
+        )
+        hotspot = (overlay_close_probe or {}).get("candidate")
+        if hotspot and hotspot.get("x") is not None and hotspot.get("y") is not None:
+            await click_canvas_design_position(page, hotspot["x"], hotspot["y"])
+            await asyncio.sleep(0.5)
+            cleared = True
+    except Exception:
+        pass
+
+    if cleared:
+        return cleared
+
+    # --- Strategy 3: broad partial-name scan, most-top-right active node ---
     seen_paths: set[str] = set()
     candidates: list[tuple[float, float, dict]] = []
     # Patterns ordered from most specific to least specific
@@ -1765,26 +2004,174 @@ async def maybe_clear_lobby_popup(page) -> bool:
         except Exception:
             pass
 
-    # --- Strategy 3: coordinate-based fallback (event banner X, modal X) ---
-    event_result = await safe_click_design_position(
-        page,
-        DEFAULT_EVENT_CLOSE_X,
-        DEFAULT_EVENT_CLOSE_Y,
-        attempts=2,
-        wait_ms=800,
-    )
-    cleared = cleared or (event_result is not None)
-
-    modal_close_result = await safe_click_design_position(
-        page,
-        DEFAULT_MODAL_CLOSE_X,
-        DEFAULT_MODAL_CLOSE_Y,
-        attempts=2,
-        wait_ms=800,
-    )
-    cleared = cleared or (modal_close_result is not None)
+    # --- Strategy 4: coordinate-based fallback (event banner X, modal X) ---
+    if overlay_close_probe and overlay_close_probe.get("overlayDetected"):
+        for x, y in (
+            (DEFAULT_AD_CLOSE_X, DEFAULT_AD_CLOSE_Y),
+            (DEFAULT_EVENT_CLOSE_X, DEFAULT_EVENT_CLOSE_Y),
+            (DEFAULT_MODAL_CLOSE_X, DEFAULT_MODAL_CLOSE_Y),
+        ):
+            result = await safe_click_design_position(
+                page,
+                x,
+                y,
+                attempts=2,
+                wait_ms=800,
+            )
+            if result is not None:
+                cleared = True
+                break
 
     return cleared
+
+
+async def read_lobby_room_controls(page) -> dict | None:
+    return await page.evaluate(
+        """
+        () => {
+          const ccGlobal = window.cc;
+          const scene = ccGlobal && ccGlobal.director && ccGlobal.director.getScene
+            ? ccGlobal.director.getScene()
+            : null;
+          const view = ccGlobal && ccGlobal.view && ccGlobal.view.getDesignResolutionSize
+            ? ccGlobal.view.getDesignResolutionSize()
+            : null;
+          if (!scene || !view) {
+            return null;
+          }
+
+          function byName(node, name) {
+            return (node && Array.isArray(node.children) ? node.children : []).find((child) => child.name === name) || null;
+          }
+
+          function pathNode(path) {
+            let node = scene;
+            for (const name of path) {
+              node = byName(node, name);
+              if (!node) return null;
+            }
+            return node;
+          }
+
+          function center(node) {
+            if (!node || !node.activeInHierarchy || !node.getBoundingBoxToWorld) {
+              return null;
+            }
+            const box = node.getBoundingBoxToWorld();
+            return {
+              x: box.x + box.width / 2,
+              y: view.height - (box.y + box.height / 2),
+            };
+          }
+
+          const normalGame = pathNode(['LobbyLayer', 'NormalGame']);
+          if (!normalGame) {
+            return null;
+          }
+          const roomListPanel = byName(normalGame, 'RoomListPanel');
+          const roomContainer = roomListPanel ? byName(roomListPanel, 'RoomContainer') : null;
+          const roomMatchPanel = byName(normalGame, 'RoomMatchPanel');
+          const detailGroup = roomMatchPanel ? byName(roomMatchPanel, 'DetailGroup') : null;
+
+          const roomItems = [];
+          for (const child of (roomContainer && roomContainer.children ? roomContainer.children : [])) {
+            if (!child || !child.activeInHierarchy || !String(child.name || '').startsWith('RoomListIten_')) continue;
+            const openRoom = byName(child, 'OpenRoom');
+            const emptyRoom = byName(child, 'EmptyRoom');
+            roomItems.push({
+              name: child.name || null,
+              item_center: center(child),
+              open_active: Boolean(openRoom && openRoom.activeInHierarchy),
+              open_center: center(openRoom || child),
+              empty_active: Boolean(emptyRoom && emptyRoom.activeInHierarchy),
+              empty_center: center(emptyRoom || child),
+            });
+          }
+
+          const startButton = pathNode([
+            'LobbyLayer', 'NormalGame', 'RoomMatchPanel', 'DetailGroup', 'StartGameButton'
+          ]);
+          const leaveButton = pathNode([
+            'LobbyLayer', 'NormalGame', 'RoomMatchPanel', 'DetailGroup', 'LeaveButton'
+          ]);
+          const newRoomButton = pathNode([
+            'LobbyLayer', 'BottomPanel', 'AreaSettingGroup', 'NormalSetting', 'RoomSettingNode', 'NewRoomButton'
+          ]);
+          const quickJoinButton = pathNode([
+            'LobbyLayer', 'BottomPanel', 'AreaSettingGroup', 'NormalSetting', 'RoomSettingNode', 'QuickJoinButton'
+          ]);
+
+          return {
+            room_items: roomItems,
+            room_match_panel_active: Boolean(roomMatchPanel && roomMatchPanel.activeInHierarchy),
+            start_game_active: Boolean(startButton && startButton.activeInHierarchy),
+            start_game_center: center(startButton),
+            leave_game_active: Boolean(leaveButton && leaveButton.activeInHierarchy),
+            leave_game_center: center(leaveButton),
+            new_room_active: Boolean(newRoomButton && newRoomButton.activeInHierarchy),
+            new_room_center: center(newRoomButton),
+            quick_join_active: Boolean(quickJoinButton && quickJoinButton.activeInHierarchy),
+            quick_join_center: center(quickJoinButton),
+          };
+        }
+        """
+    )
+
+
+async def maybe_start_room_match(page) -> bool:
+    try:
+        controls = await read_lobby_room_controls(page)
+    except Exception:
+        return False
+    if not controls or not controls.get("start_game_active"):
+        return False
+    center = controls.get("start_game_center")
+    if not center:
+        return False
+    await click_canvas_design_position(page, center["x"], center["y"])
+    await asyncio.sleep(0.8)
+    return True
+
+
+async def enter_room_from_lobby(page, logger: RunLogger, attempt: int) -> bool:
+    controls = await read_lobby_room_controls(page)
+    if controls is None:
+        logger.log(f"enter_game attempt={attempt} room controls unavailable")
+        return False
+
+    room_items = list(controls.get("room_items") or [])
+    open_rooms = [item for item in room_items if item.get("open_active") and item.get("open_center")]
+    empty_rooms = [item for item in room_items if item.get("empty_active") and item.get("empty_center")]
+
+    if open_rooms:
+        chosen = open_rooms[0]
+        center = chosen.get("open_center")
+        logger.log(f"enter_game attempt={attempt} joining open room via {chosen.get('name')}")
+        await click_canvas_design_position(page, center["x"], center["y"])
+        await asyncio.sleep(1.0)
+        return True
+
+    if controls.get("new_room_active") and controls.get("new_room_center"):
+        center = controls["new_room_center"]
+        logger.log(f"enter_game attempt={attempt} creating room via NewRoomButton")
+        await click_canvas_design_position(page, center["x"], center["y"])
+        await asyncio.sleep(1.0)
+        return True
+
+    if empty_rooms:
+        chosen = empty_rooms[0]
+        center = chosen.get("empty_center") or chosen.get("item_center")
+        if center:
+            logger.log(f"enter_game attempt={attempt} using empty room slot via {chosen.get('name')}")
+            await click_canvas_design_position(page, center["x"], center["y"])
+            await asyncio.sleep(1.0)
+            return True
+
+    logger.log(
+        f"enter_game attempt={attempt} no room-list target available "
+        f"(open={len(open_rooms)} empty={len(empty_rooms)} new_room_active={controls.get('new_room_active')})"
+    )
+    return False
 
 
 async def ensure_game_scene_from_lobby(
@@ -1819,6 +2206,17 @@ async def ensure_game_scene_from_lobby(
         # we end up entering a game with whatever the default settings were.
         ready = await wait_for_lobby_settings_ready(page, timeout_ms=12000)
         logger.log(f"enter_game attempt={attempt} lobby_settings_ready={ready}")
+        if not ready:
+            if attempt < attempts:
+                logger.log(
+                    f"enter_game attempt={attempt} lobby settings not ready; waiting 4s before retry"
+                )
+                await asyncio.sleep(4)
+                continue
+            logger.log(
+                f"enter_game attempt={attempt} lobby settings not ready; refusing to quick-play with unknown rule"
+            )
+            return page, lobby_scene
 
         # Use a small max_attempts so lobby setup finishes quickly.
         # The text=None lobby bug can cause full 12-cycle traversals (8+ s each);
@@ -1831,17 +2229,33 @@ async def ensure_game_scene_from_lobby(
         )
         if rule_text is None or amount_text is None:
             logger.log(
-                f"enter_game attempt={attempt} lobby settings unreadable; proceeding with current defaults"
+                f"enter_game attempt={attempt} lobby settings unreadable; refusing to quick-play"
             )
+            if attempt < attempts:
+                await asyncio.sleep(4)
+                continue
+            return page, lobby_scene
+        if not is_normal_rule_text(rule_text):
+            logger.log(
+                f"enter_game attempt={attempt} wrong rule={rule_text!r}; refusing to quick-play"
+            )
+            if attempt < attempts:
+                await asyncio.sleep(4)
+                continue
+            return page, lobby_scene
 
-        quick_play_result = await safe_click_design_position(
-            page,
-            DEFAULT_QUICK_PLAY_X,
-            DEFAULT_QUICK_PLAY_Y,
-            attempts=3,
-            wait_ms=1000,
-        )
-        logger.log(f"enter_game attempt={attempt} clicked_quick_play={quick_play_result is not None}")
+        room_entry_result = await enter_room_from_lobby(page, logger, attempt)
+        logger.log(f"enter_game attempt={attempt} room_entry_result={room_entry_result}")
+        quick_play_result = None
+        if not room_entry_result:
+            quick_play_result = await safe_click_design_position(
+                page,
+                DEFAULT_QUICK_PLAY_X,
+                DEFAULT_QUICK_PLAY_Y,
+                attempts=3,
+                wait_ms=1000,
+            )
+            logger.log(f"enter_game attempt={attempt} clicked_quick_play={quick_play_result is not None}")
         page = resolve_active_page(page)
         scene = await wait_for_game_scene(page, timeout_seconds=45)
         page = resolve_active_page(page)
@@ -2106,6 +2520,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
         output_dir = settings.artifact_dir / datetime.now().strftime("%Y%m%d-%H%M%S") / "autoplay_agent"
         output_dir.mkdir(parents=True, exist_ok=True)
         video_dir = output_dir / "video" if record_video else None
+        os.environ["BIG2_AGENT_DEBUG_DIR"] = str(output_dir.resolve())
         agent = build_decision_agent()
 
         async with BrowserSession(settings, record_video_dir=video_dir) as session:
@@ -2129,7 +2544,8 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
 
             loop = asyncio.get_running_loop()
             hard_deadline = loop.time() + timeout_seconds
-            games_played = 0            # complete sessions (lobby returns); stop at games_to_play
+            sessions_played = 0         # complete sessions (lobby returns); stop at games_to_play
+            games_completed = 0         # individual games (局) finished overall; logging only
             game_number = 0             # individual games (局) finished within current session
             was_in_game_scene = False
             last_failed_signature = None
@@ -2138,6 +2554,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
             idle_poll_count: int = 0    # counts idle polls; used to throttle finish3 checks
             game_has_started: bool = False  # True once ≥5 cards seen this game
             in_scoring_wait: bool = False   # True after a game ends, until fresh cards dealt
+            score_dialog_dismissed: bool = False
 
             def _any_player_emptied(state: dict) -> bool:
                 """Return True when any player's hand has dropped to 0 this game."""
@@ -2202,22 +2619,23 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     # The game only returns to lobby after all games in the
                     # session are done OR a player went bankrupt.  Either way
                     # this is the definitive end of one session.
-                    games_played += 1
+                    sessions_played += 1
                     was_in_game_scene = False
                     game_has_started = False
                     in_scoring_wait = False
+                    score_dialog_dismissed = False
                     last_failed_signature = None
                     skip_count = 0
                     logger.log(
-                        f"Session {games_played}/{games_to_play} complete "
+                        f"Session {sessions_played} complete "
                         f"({game_number} game(s) played; returned to lobby)"
                     )
                     game_number = 0
-                    if games_played >= games_to_play:
+                    if sessions_played >= games_to_play:
                         break
 
                 if scene != "GameScene":
-                    if scene == "LobbyScene" and games_played < games_to_play:
+                    if scene == "LobbyScene" and sessions_played < games_to_play:
                         page, scene = await ensure_game_scene_from_lobby(page, logger, attempts=2)
                     elif scene not in ("LobbyScene", "GameCanvas"):
                         logger.log(f"Waiting for game canvas (stage={scene}, url={page.url!r})")
@@ -2225,6 +2643,9 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     continue
 
                 state = await read_big2_game_state(page)
+
+                if in_scoring_wait and not score_dialog_dismissed:
+                    score_dialog_dismissed = await maybe_click_score_no(page, logger, action_log)
 
                 # Update game-started flag.
                 # Conditions: our hand has >= 5 cards AND all readable enemy
@@ -2253,6 +2674,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                             and enemy_counts
                             and all(c >= 10 for c in enemy_counts)):
                         in_scoring_wait = False
+                        score_dialog_dismissed = False
                         game_has_started = True
                 else:
                     if (my_count >= 5
@@ -2268,8 +2690,10 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 # have fresh cards, so this block fires exactly once per game.
                 if _any_player_emptied(state):
                     game_number += 1
+                    games_completed += 1
                     game_has_started = False
                     in_scoring_wait = True
+                    score_dialog_dismissed = False
                     last_failed_signature = None
                     skip_count = 0
                     logger.log(
@@ -2278,6 +2702,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                         f"enemies={[p.get('remain_text') for p in state.get('enemy_profiles', [])]} "
                         f"— waiting for next game or lobby return"
                     )
+                    score_dialog_dismissed = await maybe_click_score_no(page, logger, action_log)
                     await page.wait_for_timeout(3000)
                     continue
 
@@ -2369,19 +2794,22 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     result = await execute_packet_decision(page, state, decision)
                 else:
                     result = await execute_agent_decision(page, state, decision)
+                logger.log(f"Executor result: ok={result.get('ok')} reason={result.get('reason')}")
+                step_name = "agent_decision"
+                if result.get("reason") == "state_changed_before_send" and result.get("sent") is False:
+                    step_name = "agent_decision_skipped"
                 action_log.append(
                     {
-                        "step": "agent_decision",
+                        "step": step_name,
                         "observation": observation.model_dump(),
                         "decision": decision.model_dump(),
                         "result": result,
                     }
                 )
-                logger.log(f"Executor result: ok={result.get('ok')} reason={result.get('reason')}")
                 if result.get("ok"):
                     last_failed_signature = None
                     skip_count = 0
-                elif result.get("reason") in {"selection_mismatch", "play_not_confirmed"}:
+                elif result.get("reason") in {"selection_mismatch", "play_not_confirmed", "play_confirmation_timeout"}:
                     if decision_signature != last_failed_signature:
                         skip_count = 0
                     last_failed_signature = decision_signature
@@ -2410,6 +2838,10 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 json.dumps(timeline, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            (output_dir / "ml_state.json").write_text(
+                json.dumps(build_ml_state(timeline), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             turn_summary = summarize_turns(timeline)
             (output_dir / "turn_summary.json").write_text(
                 json.dumps(turn_summary, ensure_ascii=False, indent=2),
@@ -2419,6 +2851,13 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 format_turn_summary_text(turn_summary),
                 encoding="utf-8",
             )
+            review_path = write_markdown_report(output_dir)
+            session_review_path = write_session_review(output_dir)
+            training_dataset_path, training_summary_path = write_training_export(output_dir)
+            logger.log(f"Saved decision review: {review_path}")
+            logger.log(f"Saved session review: {session_review_path}")
+            logger.log(f"Saved training dataset: {training_dataset_path}")
+            logger.log(f"Saved training summary: {training_summary_path}")
             logger.log(f"Saved autoplay-agent artifacts to {output_dir}")
             print(f"Saved autoplay-agent artifacts to: {output_dir}")
 
@@ -2525,6 +2964,9 @@ def main() -> None:
         return
     if args.command == "build-agent-observation":
         asyncio.run(run_build_agent_observation(args.path))
+        return
+    if args.command == "build-ml-state":
+        asyncio.run(run_build_ml_state(args.path))
         return
     if args.command == "build-agent-decision":
         asyncio.run(run_build_agent_decision(args.path, args.mode))

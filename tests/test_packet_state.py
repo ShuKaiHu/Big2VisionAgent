@@ -170,3 +170,69 @@ def test_build_live_agent_observation_normalizes_self_lead_constraint():
     assert observation.constraint.last_played_by is None
     assert observation.constraint.last_played_cards == []
     assert any(action.action == "play" for action in observation.legal_actions)
+
+
+def test_build_live_agent_observation_parses_runtime_enemy_counts_and_seats():
+    timeline = [
+        {"event": "self_hand_snapshot", "seq": 1, "cards": ["26", "47", "27"]},
+    ]
+    runtime_state = {
+        "turn": "self",
+        "current_required_type": None,
+        "my_cards": [
+            {"sprite_frame": "c26"},
+            {"sprite_frame": "c47"},
+            {"sprite_frame": "c27"},
+        ],
+        "my_playable_indexes": [0, 1, 2],
+        "action_buttons": {"pass": {"active": True}},
+        "enemy_profiles": [
+            {"center": {"x": 120}, "remain_text": "9"},
+            {"center": {"x": 860}, "remain_text": "4"},
+            {"center": {"x": 1500}, "remain_text": "1"},
+        ],
+    }
+
+    observation = build_live_agent_observation(timeline, runtime_state)
+
+    assert [(opp.seat, opp.remaining_count) for opp in observation.opponents] == [
+        ("left", 9),
+        ("top", 4),
+        ("right", 1),
+    ]
+
+
+def test_build_live_agent_observation_filters_non_max_singles_when_right_has_one_card():
+    timeline = [
+        {"event": "self_hand_snapshot", "seq": 1, "cards": ["43", "44", "35", "36", "37", "38", "1K"]},
+    ]
+    runtime_state = {
+        "turn": "self",
+        "current_required_type": None,
+        "my_cards": [
+            {"sprite_frame": "c43"},
+            {"sprite_frame": "c44"},
+            {"sprite_frame": "c35"},
+            {"sprite_frame": "c36"},
+            {"sprite_frame": "c37"},
+            {"sprite_frame": "c38"},
+            {"sprite_frame": "c1K"},
+        ],
+        "my_playable_indexes": [0, 1, 2, 3, 4, 5, 6],
+        "action_buttons": {"pass": {"active": False}},
+        "enemy_profiles": [
+            {"seat": "right", "remaining_count": 1},
+            {"seat": "top", "remaining_count": 5},
+            {"seat": "left", "remaining_count": 5},
+        ],
+    }
+
+    observation = build_live_agent_observation(timeline, runtime_state)
+
+    single_codes = [
+        action.cards[0].code
+        for action in observation.legal_actions
+        if action.action == "play" and action.combo_type == "single"
+    ]
+    assert single_codes == ["1K"]
+    assert any(action.action == "play" and action.combo_type == "straight" for action in observation.legal_actions)
