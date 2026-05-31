@@ -9,10 +9,10 @@ from datetime import datetime
 from pathlib import Path
 
 from big2_vision_agent.browser.actions import (
-    click_active_label_text,
     click_named_node,
     click_canvas_design_position,
     click_design_point,
+    deselect_all_selected_cards,
     invoke_node,
     invoke_named_node,
     probe_nodes,
@@ -46,14 +46,12 @@ DEFAULT_QUICK_PLAY_X = 885.0
 DEFAULT_QUICK_PLAY_Y = 948.0
 DEFAULT_POPUP_CONFIRM_X = 864.0
 DEFAULT_POPUP_CONFIRM_Y = 741.0
-DEFAULT_AD_CLOSE_X = 1758.0
-DEFAULT_AD_CLOSE_Y = 76.0
-DEFAULT_EVENT_CLOSE_X = 1655.0
-DEFAULT_EVENT_CLOSE_Y = 96.0
+DEFAULT_EVENT_CLOSE_X = 1695.0
+DEFAULT_EVENT_CLOSE_Y = 68.0
 DEFAULT_MODAL_CLOSE_X = 1308.0
 DEFAULT_MODAL_CLOSE_Y = 257.0
 DEFAULT_AMOUNT_TARGET = "10元"
-DEFAULT_RULE_TARGET = "正常局"
+DEFAULT_RULE_TARGET = "不換牌"
 IDLE_POLL_MS = 180
 POST_ACTION_WAIT_MS = 220
 
@@ -537,7 +535,16 @@ def is_self_actionable_turn(state: dict) -> bool:
     action_buttons = state.get("action_buttons", {})
     pass_button = action_buttons.get("pass", {})
     play_button = action_buttons.get("play", {})
-    return bool(pass_button.get("active") or play_button.get("active"))
+    if pass_button.get("active") or play_button.get("active"):
+        return True
+    # 遊戲開始持有梅花三時，pass/play 按鈕都是灰的（不能 PASS、尚未選牌），
+    # 但牌型按鈕（單張/一對/順子…）是 active 的。
+    # 用牌型按鈕是否有 active 來補足這個情境。
+    card_type_buttons = state.get("card_type_buttons", {})
+    return any(
+        isinstance(btn, dict) and btn.get("active")
+        for btn in card_type_buttons.values()
+    )
 
 
 def summarize_table_play(state: dict) -> dict | None:
@@ -630,37 +637,6 @@ def maybe_record_turn_event(
         )
     else:
         logger.log(f"Turn event: {previous_turn} passed")
-
-
-async def maybe_click_score_no(
-    page,
-    logger: RunLogger | None = None,
-    action_log: list[dict[str, object]] | None = None,
-) -> bool:
-    try:
-        result = await click_active_label_text(page, ["否", "No"])
-    except Exception as exc:
-        if logger is not None:
-            logger.log(f"Score dialog dismiss probe failed: {exc}")
-        return False
-
-    if not result.get("clicked"):
-        return False
-
-    if logger is not None:
-        logger.log(
-            "Dismissed score dialog: "
-            f"text={result.get('text')!r} mode={result.get('mode')} node={result.get('node_name')!r}"
-        )
-    if action_log is not None:
-        action_log.append(
-            {
-                "step": "click_score_no",
-                "result": result,
-            }
-        )
-    await page.wait_for_timeout(800)
-    return True
 
 
 async def read_lobby_selector(page, node_name: str) -> dict | None:
@@ -892,8 +868,8 @@ async def ensure_normal_rule(page, max_attempts: int = 12) -> str | None:
 
     Order of preference:
       1. Exact match for DEFAULT_RULE_TARGET (so user can override).
-      2. Any option whose label contains "正常" (game's no-swap variant).
-      3. Any option whose label contains "不換".
+      2. Any option whose label contains "不換".
+      3. Any option whose label contains "正常" (game's no-swap variant).
       4. Whatever the cycle landed on last as a final fallback.
     """
     if not await wait_for_lobby_settings_ready(page):
@@ -908,24 +884,18 @@ async def ensure_normal_rule(page, max_attempts: int = 12) -> str | None:
         target = DEFAULT_RULE_TARGET
     if target is None:
         for opt in options:
-            if "正常" in opt:
+            if "不換" in opt:
                 target = opt
                 break
     if target is None:
         for opt in options:
-            if "不換" in opt:
+            if "正常" in opt:
                 target = opt
                 break
     if target is None:
         target = options[-1]
 
     return await ensure_lobby_selector(page, "RuleNode", target, max_attempts=max_attempts * 2)
-
-
-def is_normal_rule_text(rule_text: str | None) -> bool:
-    if not rule_text:
-        return False
-    return ("正常" in rule_text) or ("不換" in rule_text)
 
 
 async def ensure_min_amount(page, max_attempts: int = 12) -> str | None:
@@ -1543,7 +1513,19 @@ async def clear_selected_cards(
         return state
 
     logger.log(f"Clearing stale selection before acting: selected_count={selected_count}")
-    cancel_button = state.get("action_buttons", {}).get("cancel", {})
+
+    # Primary path: call setSelect(false) on all selected cards via Cocos API.
+    # toggle_my_card_by_sprite always calls setSelect(true) and CANNOT deselect;
+    # pixel clicks are unreliable on overlapping cards (~70% overlap).
+    await deselect_all_selected_cards(page)
+    action_log.append({"step": "clear_selection_via_deselect_all"})
+    refreshed = await read_big2_game_state(page)
+    logger.log(f"Selection after card reset: selected_count={refreshed.get('my_selected_count', 0)}")
+    if refreshed.get("my_selected_count", 0) == 0:
+        return refreshed
+
+    # Fallback: cancel button if Cocos API deselect didn't fully clear.
+    cancel_button = refreshed.get("action_buttons", {}).get("cancel", {})
     if cancel_button.get("active") and cancel_button.get("center"):
         center = cancel_button["center"]
         await click_design_point(page, center["x"], center["y"])
@@ -1551,38 +1533,7 @@ async def clear_selected_cards(
         await page.wait_for_timeout(400)
         refreshed = await read_big2_game_state(page)
         logger.log(f"Selection after cancel: selected_count={refreshed.get('my_selected_count', 0)}")
-        if refreshed.get("my_selected_count", 0) == 0:
-            return refreshed
-        # Cancel did not actually clear the selection (observed when the
-        # game's cancel button is "active" visually but doesn't react to
-        # the click). Fall through to deselecting each card via sprite-toggle.
-        state = refreshed
 
-    # Per-card deselection. Prefer toggle_my_card_by_sprite (Cocos-API) over
-    # pixel clicks so we never hit the overlapping-card off-by-one issue. The
-    # toggle helper emits a click on the underlying node which, for an
-    # already-selected card, deselects it via the game's own handler.
-    for index, card in enumerate(state.get("my_cards", [])):
-        if not card.get("selected"):
-            continue
-        sprite_frame = card.get("sprite_frame")
-        if isinstance(sprite_frame, str) and sprite_frame:
-            try:
-                await toggle_my_card_by_sprite(page, sprite_frame)
-                action_log.append({"step": "clear_selection_via_sprite", "sprite_frame": sprite_frame})
-                await page.wait_for_timeout(120)
-                continue
-            except Exception:
-                pass
-        center = card.get("center")
-        if not center:
-            continue
-        await click_design_point(page, center["x"], center["y"])
-        action_log.append({"step": "clear_selection_via_card", "index": index})
-        await page.wait_for_timeout(250)
-
-    refreshed = await read_big2_game_state(page)
-    logger.log(f"Selection after card reset: selected_count={refreshed.get('my_selected_count', 0)}")
     return refreshed
 
 
@@ -1659,7 +1610,6 @@ async def wait_for_game_scene(page, timeout_seconds: int = 60) -> str | None:
         last_scene = await safe_read_current_scene(page)
         if last_scene == "GameScene":
             return last_scene
-        await maybe_start_room_match(page)
         now = asyncio.get_running_loop().time()
         if now - last_popup_clear >= 5:
             await maybe_clear_lobby_popup(page)
@@ -1675,88 +1625,73 @@ async def maybe_clear_lobby_popup(page) -> bool:
     """
     Attempt to dismiss any lobby popup.
 
+    Strategy -1: coordinate-based preemptive click on event banner X button
+                 (e.g. 賭城傳奇 full-screen banner).  Always runs FIRST so
+                 that later strategies (which might return early) don't skip it.
     Strategy 0: JS walk — find any active button whose label text is one of
-                the known dismiss strings (確定, OK, 關閉, …) and emit a
+                the known dismiss strings (確定, OK, 關閉, ×, …) and emit a
                 Cocos touch event on it.  Works regardless of node name.
     Strategy 1: invoke known dialog close button node names (exact match).
                 New names should be added here as they are discovered via
                 scene-dump / lobby-wait.
-    Strategy 2: right-top hotspot scan for active small close controls.
-                This targets ad panels like the screenshoted event banner:
-                click the top-right red X and avoid the mid-right reward orb.
-    Strategy 3: broad partial-name scan for active close-button-style nodes;
+    Strategy 2: broad partial-name scan for active close-button-style nodes;
                 picks the candidate closest to the top-right corner of the
                 canvas (most likely a popup X, not a settings-panel button).
-    Strategy 4: coordinate-based fallback for event banners / modal dialogs.
+    Strategy 3: coordinate-based fallback for modal dialogs.
     """
     cleared = False
 
-    # --- Strategy -1: DOM/HTML modal close ---
-    # Some new ads/prompts are plain DOM overlays rather than Cocos nodes.
+    # --- Strategy -1a: JS invoke — target known event/ad panel close nodes ---
+    # ADPanel (賭城傳奇, daily login, etc.) close buttons have predictable node
+    # names.  Invoke via cc.Component.EventHandler.emitEvents first so we don't
+    # rely on pixel-perfect coordinates.
+    AD_PANEL_CLOSE_NODES = [
+        "CloseAreaButton",   # ADPanel banner × (confirmed ADPanel node name)
+        "CloseButton",       # common event panel close
+        "BtnClose",
+        "btnClose",
+        "close_btn",
+    ]
+    for _ad_node in AD_PANEL_CLOSE_NODES:
+        if cleared:
+            break
+        try:
+            result = await invoke_node(page, _ad_node, exact=True)
+            if result.get("invoked"):
+                await asyncio.sleep(0.6)
+                cleared = True
+        except Exception:
+            pass
+
+    # --- Strategy -1b: coordinate-based click on event banner X button ---
+    # Full-screen event banners (e.g. 賭城傳奇) have an X button near the
+    # top-right corner at approximately design (1695, 68).
+    # Always runs even if Strategy -1a already fired, to handle banners whose
+    # close node isn't in the list above.  Clicking empty space is harmless.
     try:
-        dom_cleared = await page.evaluate("""
-        (() => {
-            const dismissTexts = ['關閉', 'Close', '確定', 'OK', '知道了', '略過', '跳過', '取消', '否'];
-            const selectors = [
-              '[aria-label="Close"]',
-              '[aria-label="close"]',
-              '[data-testid="close"]',
-              '.close',
-              '.btn-close',
-              '.modal-close',
-              '.popup-close',
-              '#easyDialogBox .close',
-              '#easyDialogBox button',
-              '#easyDialogBox a',
-              '#overlay',
-            ];
-
-            function visible(el) {
-              if (!el) return false;
-              const style = window.getComputedStyle(el);
-              if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-              const rect = el.getBoundingClientRect();
-              return rect.width > 0 && rect.height > 0;
-            }
-
-            for (const selector of selectors) {
-              for (const el of document.querySelectorAll(selector)) {
-                if (!visible(el)) continue;
-                try {
-                  el.click();
-                  return { clicked: true, selector };
-                } catch (error) {}
-              }
-            }
-
-            const candidates = Array.from(document.querySelectorAll('button, a, div, span'));
-            for (const el of candidates) {
-              if (!visible(el)) continue;
-              const text = (el.textContent || '').trim();
-              if (!dismissTexts.includes(text)) continue;
-              try {
-                el.click();
-                return { clicked: true, text };
-              } catch (error) {}
-            }
-            return { clicked: false };
-        })()
-        """)
-        if dom_cleared and dom_cleared.get("clicked"):
-            await asyncio.sleep(0.6)
+        event_result = await safe_click_design_position(
+            page,
+            DEFAULT_EVENT_CLOSE_X,
+            DEFAULT_EVENT_CLOSE_Y,
+            attempts=1,
+            wait_ms=600,
+        )
+        if event_result is not None:
             cleared = True
     except Exception:
         pass
 
     # --- Strategy 0: JS walk — click by label text ---
     # Handles dialogs like 房間已滿 that have a 確定 button but no X node.
+    # Also handles banners whose X button has '×' as its label text.
     # Uses the same cc.Component.EventHandler.emitEvents mechanism as
     # invoke_node (known to work), but searches by Label.string instead of
     # node name.
     try:
         clicked_text = await page.evaluate("""
         (() => {
-            const DISMISS_TEXTS = ['確定', 'OK', '關閉', 'Close', '知道了', '确定'];
+            const DISMISS_TEXTS = ['確定', 'OK', '關閉', 'Close', '知道了', '确定', '×', 'X', '✕', '✗',
+                                   '下次吧！', '下次吧', '下次', '取消', '跳過', '略過', 'Skip', 'Cancel'];
             const cc = window.cc;
             if (!cc || !cc.director) return null;
             const scene = cc.director.getScene();
@@ -1859,114 +1794,7 @@ async def maybe_clear_lobby_popup(page) -> bool:
     if cleared:
         return cleared
 
-    # --- Strategy 2: top-right small clickable hotspot ---
-    # Event ads can use generic node names, but the close affordance is still a
-    # small clickable widget in the extreme top-right. Restrict the search to
-    # that hotspot so we do not hit the large mid-right reward button.
-    overlay_close_probe = None
-    try:
-        overlay_close_probe = await page.evaluate(
-            """
-            (() => {
-              const ccGlobal = window.cc;
-              const scene = ccGlobal && ccGlobal.director && ccGlobal.director.getScene
-                ? ccGlobal.director.getScene()
-                : null;
-              const view = ccGlobal && ccGlobal.view && ccGlobal.view.getDesignResolutionSize
-                ? ccGlobal.view.getDesignResolutionSize()
-                : null;
-              if (!scene || !view) {
-                return null;
-              }
-
-              function rect(node) {
-                if (!node || !node.getBoundingBoxToWorld) return null;
-                try {
-                  const box = node.getBoundingBoxToWorld();
-                  return {
-                    x: box.x,
-                    y: box.y,
-                    width: box.width,
-                    height: box.height,
-                    centerX: box.x + box.width / 2,
-                    centerYTop: view.height - (box.y + box.height / 2),
-                  };
-                } catch (error) {
-                  return null;
-                }
-              }
-
-              function isClickable(node) {
-                if (!node) return false;
-                try {
-                  const button = node.getComponent && (node.getComponent('cc.Button') || node.getComponent(ccGlobal.Button));
-                  if (button) return true;
-                } catch (error) {}
-                try {
-                  return (node._components || []).some((component) => Array.isArray(component && component.clickEvents) && component.clickEvents.length > 0);
-                } catch (error) {
-                  return false;
-                }
-              }
-
-              const candidates = [];
-              let overlayDetected = false;
-              function visit(node, path) {
-                if (!node || !node.activeInHierarchy) return;
-                const nextPath = [...path, node.name || ''];
-                const box = rect(node);
-                if (box) {
-                  const largeCenteredPanel =
-                    box.width * box.height >= view.width * view.height * 0.18 &&
-                    box.centerX >= view.width * 0.22 &&
-                    box.centerX <= view.width * 0.78 &&
-                    box.centerYTop >= view.height * 0.12 &&
-                    box.centerYTop <= view.height * 0.88;
-                  if (largeCenteredPanel) {
-                    overlayDetected = true;
-                  }
-                  const inHotspot = box.centerX >= view.width * 0.88 && box.centerYTop <= view.height * 0.18;
-                  const sensibleSize = box.width >= 12 && box.height >= 12 && box.width <= 220 && box.height <= 220;
-                  if (inHotspot && sensibleSize && isClickable(node)) {
-                    candidates.push({
-                      path: nextPath.join(' / '),
-                      name: node.name || '',
-                      x: box.centerX,
-                      y: box.centerYTop,
-                      area: box.width * box.height,
-                      score: (view.width - box.centerX) * 1.5 + box.centerYTop + (box.width * box.height) / 1200,
-                    });
-                  }
-                }
-                for (const child of (node.children || [])) {
-                  visit(child, nextPath);
-                }
-              }
-
-              visit(scene, []);
-              if (!overlayDetected) {
-                return { overlayDetected: false, candidate: null };
-              }
-              if (!candidates.length) {
-                return { overlayDetected: true, candidate: null };
-              }
-              candidates.sort((a, b) => a.score - b.score);
-              return { overlayDetected: true, candidate: candidates[0] };
-            })()
-            """
-        )
-        hotspot = (overlay_close_probe or {}).get("candidate")
-        if hotspot and hotspot.get("x") is not None and hotspot.get("y") is not None:
-            await click_canvas_design_position(page, hotspot["x"], hotspot["y"])
-            await asyncio.sleep(0.5)
-            cleared = True
-    except Exception:
-        pass
-
-    if cleared:
-        return cleared
-
-    # --- Strategy 3: broad partial-name scan, most-top-right active node ---
+    # --- Strategy 2: broad partial-name scan, most-top-right active node ---
     seen_paths: set[str] = set()
     candidates: list[tuple[float, float, dict]] = []
     # Patterns ordered from most specific to least specific
@@ -2004,173 +1832,95 @@ async def maybe_clear_lobby_popup(page) -> bool:
         except Exception:
             pass
 
-    # --- Strategy 4: coordinate-based fallback (event banner X, modal X) ---
-    if overlay_close_probe and overlay_close_probe.get("overlayDetected"):
-        for x, y in (
-            (DEFAULT_AD_CLOSE_X, DEFAULT_AD_CLOSE_Y),
-            (DEFAULT_EVENT_CLOSE_X, DEFAULT_EVENT_CLOSE_Y),
-            (DEFAULT_MODAL_CLOSE_X, DEFAULT_MODAL_CLOSE_Y),
-        ):
-            result = await safe_click_design_position(
-                page,
-                x,
-                y,
-                attempts=2,
-                wait_ms=800,
-            )
-            if result is not None:
-                cleared = True
-                break
+    # --- Strategy 3: coordinate-based fallback for modal dialogs ---
+    # (Event banner X was already handled by Strategy -1 above.)
+    modal_close_result = await safe_click_design_position(
+        page,
+        DEFAULT_MODAL_CLOSE_X,
+        DEFAULT_MODAL_CLOSE_Y,
+        attempts=2,
+        wait_ms=800,
+    )
+    cleared = cleared or (modal_close_result is not None)
 
     return cleared
 
 
-async def read_lobby_room_controls(page) -> dict | None:
-    return await page.evaluate(
-        """
-        () => {
-          const ccGlobal = window.cc;
-          const scene = ccGlobal && ccGlobal.director && ccGlobal.director.getScene
-            ? ccGlobal.director.getScene()
-            : null;
-          const view = ccGlobal && ccGlobal.view && ccGlobal.view.getDesignResolutionSize
-            ? ccGlobal.view.getDesignResolutionSize()
-            : null;
-          if (!scene || !view) {
-            return null;
-          }
+async def maybe_decline_rematch_dialog(page) -> bool:
+    """結算/再來一局畫面出現時，主動點擊「否」按鈕拒絕加入下一局。
 
-          function byName(node, name) {
-            return (node && Array.isArray(node.children) ? node.children : []).find((child) => child.name === name) || null;
-          }
+    使用 Cocos JS walk 在場景中尋找 Label 文字為「否」的 active 按鈕並觸發
+    click event。若找到並成功觸發則回傳 True。
 
-          function pathNode(path) {
-            let node = scene;
-            for (const name of path) {
-              node = byName(node, name);
-              if (!node) return null;
-            }
-            return node;
-          }
-
-          function center(node) {
-            if (!node || !node.activeInHierarchy || !node.getBoundingBoxToWorld) {
-              return null;
-            }
-            const box = node.getBoundingBoxToWorld();
-            return {
-              x: box.x + box.width / 2,
-              y: view.height - (box.y + box.height / 2),
-            };
-          }
-
-          const normalGame = pathNode(['LobbyLayer', 'NormalGame']);
-          if (!normalGame) {
-            return null;
-          }
-          const roomListPanel = byName(normalGame, 'RoomListPanel');
-          const roomContainer = roomListPanel ? byName(roomListPanel, 'RoomContainer') : null;
-          const roomMatchPanel = byName(normalGame, 'RoomMatchPanel');
-          const detailGroup = roomMatchPanel ? byName(roomMatchPanel, 'DetailGroup') : null;
-
-          const roomItems = [];
-          for (const child of (roomContainer && roomContainer.children ? roomContainer.children : [])) {
-            if (!child || !child.activeInHierarchy || !String(child.name || '').startsWith('RoomListIten_')) continue;
-            const openRoom = byName(child, 'OpenRoom');
-            const emptyRoom = byName(child, 'EmptyRoom');
-            roomItems.push({
-              name: child.name || null,
-              item_center: center(child),
-              open_active: Boolean(openRoom && openRoom.activeInHierarchy),
-              open_center: center(openRoom || child),
-              empty_active: Boolean(emptyRoom && emptyRoom.activeInHierarchy),
-              empty_center: center(emptyRoom || child),
-            });
-          }
-
-          const startButton = pathNode([
-            'LobbyLayer', 'NormalGame', 'RoomMatchPanel', 'DetailGroup', 'StartGameButton'
-          ]);
-          const leaveButton = pathNode([
-            'LobbyLayer', 'NormalGame', 'RoomMatchPanel', 'DetailGroup', 'LeaveButton'
-          ]);
-          const newRoomButton = pathNode([
-            'LobbyLayer', 'BottomPanel', 'AreaSettingGroup', 'NormalSetting', 'RoomSettingNode', 'NewRoomButton'
-          ]);
-          const quickJoinButton = pathNode([
-            'LobbyLayer', 'BottomPanel', 'AreaSettingGroup', 'NormalSetting', 'RoomSettingNode', 'QuickJoinButton'
-          ]);
-
-          return {
-            room_items: roomItems,
-            room_match_panel_active: Boolean(roomMatchPanel && roomMatchPanel.activeInHierarchy),
-            start_game_active: Boolean(startButton && startButton.activeInHierarchy),
-            start_game_center: center(startButton),
-            leave_game_active: Boolean(leaveButton && leaveButton.activeInHierarchy),
-            leave_game_center: center(leaveButton),
-            new_room_active: Boolean(newRoomButton && newRoomButton.activeInHierarchy),
-            new_room_center: center(newRoomButton),
-            quick_join_active: Boolean(quickJoinButton && quickJoinButton.activeInHierarchy),
-            quick_join_center: center(quickJoinButton),
-          };
-        }
-        """
-    )
-
-
-async def maybe_start_room_match(page) -> bool:
+    只應在 in_scoring_wait=True 期間呼叫，以免在遊戲中誤觸。
+    """
     try:
-        controls = await read_lobby_room_controls(page)
-    except Exception:
-        return False
-    if not controls or not controls.get("start_game_active"):
-        return False
-    center = controls.get("start_game_center")
-    if not center:
-        return False
-    await click_canvas_design_position(page, center["x"], center["y"])
-    await asyncio.sleep(0.8)
-    return True
+        clicked = await page.evaluate("""
+        (() => {
+            const DECLINE_TEXTS = ['否', '取消', 'No', 'Cancel'];
+            const cc = window.cc;
+            if (!cc || !cc.director) return null;
+            const scene = cc.director.getScene();
+            if (!scene) return null;
 
+            let result = null;
 
-async def enter_room_from_lobby(page, logger: RunLogger, attempt: int) -> bool:
-    controls = await read_lobby_room_controls(page)
-    if controls is None:
-        logger.log(f"enter_game attempt={attempt} room controls unavailable")
-        return False
+            function walk(node) {
+                if (result) return;
+                if (!node || !node.active) return;
 
-    room_items = list(controls.get("room_items") or [])
-    open_rooms = [item for item in room_items if item.get("open_active") and item.get("open_center")]
-    empty_rooms = [item for item in room_items if item.get("empty_active") and item.get("empty_center")]
+                const label = node.getComponent &&
+                    (node.getComponent('cc.Label') || node.getComponent(cc.Label));
+                if (label && typeof label.string === 'string' &&
+                        DECLINE_TEXTS.includes(label.string.trim())) {
+                    // Walk up ≤3 levels to find a cc.Button ancestor
+                    let candidate = node;
+                    for (let i = 0; i < 3; i++) {
+                        const btn = candidate.getComponent &&
+                            (candidate.getComponent('cc.Button') ||
+                             candidate.getComponent(cc.Button));
+                        if (btn && Array.isArray(btn.clickEvents) &&
+                                btn.clickEvents.length > 0) {
+                            for (const eh of btn.clickEvents) {
+                                try {
+                                    cc.Component.EventHandler.emitEvents(
+                                        [eh], { type: 'click' }
+                                    );
+                                } catch(e) {}
+                            }
+                            result = label.string.trim();
+                            return;
+                        }
+                        if (candidate.parent) {
+                            candidate = candidate.parent;
+                        } else {
+                            break;
+                        }
+                    }
+                    // Fallback: emit on the direct parent
+                    if (!result && node.parent) {
+                        try {
+                            node.parent.emit('click');
+                            node.parent.emit('touchend');
+                            result = label.string.trim();
+                        } catch(e) {}
+                    }
+                }
 
-    if open_rooms:
-        chosen = open_rooms[0]
-        center = chosen.get("open_center")
-        logger.log(f"enter_game attempt={attempt} joining open room via {chosen.get('name')}")
-        await click_canvas_design_position(page, center["x"], center["y"])
-        await asyncio.sleep(1.0)
-        return True
+                for (const child of (node.children || [])) {
+                    walk(child);
+                }
+            }
 
-    if controls.get("new_room_active") and controls.get("new_room_center"):
-        center = controls["new_room_center"]
-        logger.log(f"enter_game attempt={attempt} creating room via NewRoomButton")
-        await click_canvas_design_position(page, center["x"], center["y"])
-        await asyncio.sleep(1.0)
-        return True
-
-    if empty_rooms:
-        chosen = empty_rooms[0]
-        center = chosen.get("empty_center") or chosen.get("item_center")
-        if center:
-            logger.log(f"enter_game attempt={attempt} using empty room slot via {chosen.get('name')}")
-            await click_canvas_design_position(page, center["x"], center["y"])
-            await asyncio.sleep(1.0)
+            walk(scene);
+            return result;
+        })()
+        """)
+        if clicked:
+            await asyncio.sleep(0.6)
             return True
-
-    logger.log(
-        f"enter_game attempt={attempt} no room-list target available "
-        f"(open={len(open_rooms)} empty={len(empty_rooms)} new_room_active={controls.get('new_room_active')})"
-    )
+    except Exception:
+        pass
     return False
 
 
@@ -2198,25 +1948,35 @@ async def ensure_game_scene_from_lobby(
                 f"(settings from previous attempt may apply)"
             )
             return page, lobby_scene
-        popup_cleared = await maybe_clear_lobby_popup(page)
-        logger.log(f"enter_game attempt={attempt} popup_cleared={popup_cleared}")
+        # Clear ALL popups before touching lobby settings.
+        # Loop until the lobby settings panel is confirmed readable, so that
+        # event banners (e.g. 賭城傳奇) and other overlays are fully dismissed
+        # before we try to read/set rule/amount.
+        MAX_POPUP_CLEARS = 6
+        for clear_iter in range(MAX_POPUP_CLEARS):
+            popup_cleared = await maybe_clear_lobby_popup(page)
+            logger.log(
+                f"enter_game attempt={attempt} popup_clear_iter={clear_iter + 1} cleared={popup_cleared}"
+            )
+            # Check if lobby settings panel is now accessible
+            selector = await read_lobby_selector(page, "RuleNode")
+            if selector is not None and selector.get("text"):
+                logger.log(
+                    f"enter_game attempt={attempt} lobby panel accessible after {clear_iter + 1} clear(s)"
+                )
+                break
+            if clear_iter < MAX_POPUP_CLEARS - 1:
+                await asyncio.sleep(1.0)
+        else:
+            logger.log(
+                f"enter_game attempt={attempt} lobby panel still blocked after {MAX_POPUP_CLEARS} clears; proceeding anyway"
+            )
 
         # Block on lobby BottomPanel becoming readable before reading rule/amount;
         # otherwise the very first attempt fires before the panel has rendered and
         # we end up entering a game with whatever the default settings were.
         ready = await wait_for_lobby_settings_ready(page, timeout_ms=12000)
         logger.log(f"enter_game attempt={attempt} lobby_settings_ready={ready}")
-        if not ready:
-            if attempt < attempts:
-                logger.log(
-                    f"enter_game attempt={attempt} lobby settings not ready; waiting 4s before retry"
-                )
-                await asyncio.sleep(4)
-                continue
-            logger.log(
-                f"enter_game attempt={attempt} lobby settings not ready; refusing to quick-play with unknown rule"
-            )
-            return page, lobby_scene
 
         # Use a small max_attempts so lobby setup finishes quickly.
         # The text=None lobby bug can cause full 12-cycle traversals (8+ s each);
@@ -2227,35 +1987,36 @@ async def ensure_game_scene_from_lobby(
         logger.log(
             f"enter_game attempt={attempt} settings rule={rule_text}, amount={amount_text}"
         )
+
+        # Safety check: if settings are unreadable or we ended up on a card-swap
+        # game (換牌局), do NOT click quick play — skip this attempt and retry.
         if rule_text is None or amount_text is None:
             logger.log(
-                f"enter_game attempt={attempt} lobby settings unreadable; refusing to quick-play"
+                f"enter_game attempt={attempt} lobby settings unreadable; "
+                f"skipping quick play to avoid wrong game type"
             )
             if attempt < attempts:
                 await asyncio.sleep(4)
-                continue
-            return page, lobby_scene
-        if not is_normal_rule_text(rule_text):
-            logger.log(
-                f"enter_game attempt={attempt} wrong rule={rule_text!r}; refusing to quick-play"
-            )
-            if attempt < attempts:
-                await asyncio.sleep(4)
-                continue
-            return page, lobby_scene
+            continue
 
-        room_entry_result = await enter_room_from_lobby(page, logger, attempt)
-        logger.log(f"enter_game attempt={attempt} room_entry_result={room_entry_result}")
-        quick_play_result = None
-        if not room_entry_result:
-            quick_play_result = await safe_click_design_position(
-                page,
-                DEFAULT_QUICK_PLAY_X,
-                DEFAULT_QUICK_PLAY_Y,
-                attempts=3,
-                wait_ms=1000,
+        # "換牌局" must NOT appear unless "不換" is present (not-swap variant)
+        if rule_text and "換" in rule_text and "不換" not in rule_text:
+            logger.log(
+                f"enter_game attempt={attempt} wrong rule={rule_text!r} (card-swap game); "
+                f"skipping quick play"
             )
-            logger.log(f"enter_game attempt={attempt} clicked_quick_play={quick_play_result is not None}")
+            if attempt < attempts:
+                await asyncio.sleep(2)
+            continue
+
+        quick_play_result = await safe_click_design_position(
+            page,
+            DEFAULT_QUICK_PLAY_X,
+            DEFAULT_QUICK_PLAY_Y,
+            attempts=3,
+            wait_ms=1000,
+        )
+        logger.log(f"enter_game attempt={attempt} clicked_quick_play={quick_play_result is not None}")
         page = resolve_active_page(page)
         scene = await wait_for_game_scene(page, timeout_seconds=45)
         page = resolve_active_page(page)
@@ -2520,7 +2281,6 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
         output_dir = settings.artifact_dir / datetime.now().strftime("%Y%m%d-%H%M%S") / "autoplay_agent"
         output_dir.mkdir(parents=True, exist_ok=True)
         video_dir = output_dir / "video" if record_video else None
-        os.environ["BIG2_AGENT_DEBUG_DIR"] = str(output_dir.resolve())
         agent = build_decision_agent()
 
         async with BrowserSession(settings, record_video_dir=video_dir) as session:
@@ -2544,8 +2304,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
 
             loop = asyncio.get_running_loop()
             hard_deadline = loop.time() + timeout_seconds
-            sessions_played = 0         # complete sessions (lobby returns); stop at games_to_play
-            games_completed = 0         # individual games (局) finished overall; logging only
+            games_played = 0            # complete sessions (lobby returns); stop at games_to_play
             game_number = 0             # individual games (局) finished within current session
             was_in_game_scene = False
             last_failed_signature = None
@@ -2554,7 +2313,13 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
             idle_poll_count: int = 0    # counts idle polls; used to throttle finish3 checks
             game_has_started: bool = False  # True once ≥5 cards seen this game
             in_scoring_wait: bool = False   # True after a game ends, until fresh cards dealt
-            score_dialog_dismissed: bool = False
+            last_decline_time: float = 0.0  # throttle decline calls (avoid log spam)
+            play_fail_count: int = 0    # consecutive play_not_confirmed; triggers forced pass
+            game_results: list[dict] = []   # per-game results for this run
+
+            # Persistent results log: all runs append to the same file so
+            # long-term win/loss stats accumulate across sessions.
+            results_log_path = settings.artifact_dir / "game_results.jsonl"
 
             def _any_player_emptied(state: dict) -> bool:
                 """Return True when any player's hand has dropped to 0 this game."""
@@ -2610,6 +2375,9 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 # Only attempt popup-clear when we are not in the game canvas
                 # (popup clicks at game-canvas coordinates cause ghost card lifts).
                 if scene != "GameScene":
+                    # 注意：不在這裡呼叫 maybe_decline_rematch_dialog。
+                    # 「再來一局/是否」對話框只在 GameScene 的 in_scoring_wait 期間處理。
+                    # 在大廳呼叫它可能誤點大廳按鈕造成意外加入牌局。
                     await maybe_clear_lobby_popup(page)
 
                 if scene == "GameScene":
@@ -2619,23 +2387,31 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     # The game only returns to lobby after all games in the
                     # session are done OR a player went bankrupt.  Either way
                     # this is the definitive end of one session.
-                    sessions_played += 1
+                    games_played += 1
                     was_in_game_scene = False
                     game_has_started = False
                     in_scoring_wait = False
-                    score_dialog_dismissed = False
                     last_failed_signature = None
                     skip_count = 0
+                    play_fail_count = 0
+
+                    # ── Session summary ──────────────────────────────────────────
+                    _session_results = [r for r in game_results
+                                        if r["session"] == games_played]
+                    _wins = sum(1 for r in _session_results if r["won"])
+                    _total = len(_session_results)
+                    _placements = [r["placement"] for r in _session_results]
                     logger.log(
-                        f"Session {sessions_played} complete "
-                        f"({game_number} game(s) played; returned to lobby)"
+                        f"Session {games_played}/{games_to_play} complete "
+                        f"({game_number} game(s) played; returned to lobby) "
+                        f"| wins={_wins}/{_total} placements={_placements}"
                     )
                     game_number = 0
-                    if sessions_played >= games_to_play:
+                    if games_played >= games_to_play:
                         break
 
                 if scene != "GameScene":
-                    if scene == "LobbyScene" and sessions_played < games_to_play:
+                    if scene == "LobbyScene" and games_played < games_to_play:
                         page, scene = await ensure_game_scene_from_lobby(page, logger, attempts=2)
                     elif scene not in ("LobbyScene", "GameCanvas"):
                         logger.log(f"Waiting for game canvas (stage={scene}, url={page.url!r})")
@@ -2643,9 +2419,6 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     continue
 
                 state = await read_big2_game_state(page)
-
-                if in_scoring_wait and not score_dialog_dismissed:
-                    score_dialog_dismissed = await maybe_click_score_no(page, logger, action_log)
 
                 # Update game-started flag.
                 # Conditions: our hand has >= 5 cards AND all readable enemy
@@ -2674,7 +2447,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                             and enemy_counts
                             and all(c >= 10 for c in enemy_counts)):
                         in_scoring_wait = False
-                        score_dialog_dismissed = False
+                        last_decline_time = 0.0
                         game_has_started = True
                 else:
                     if (my_count >= 5
@@ -2690,20 +2463,74 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 # have fresh cards, so this block fires exactly once per game.
                 if _any_player_emptied(state):
                     game_number += 1
-                    games_completed += 1
                     game_has_started = False
                     in_scoring_wait = True
-                    score_dialog_dismissed = False
                     last_failed_signature = None
                     skip_count = 0
+                    play_fail_count = 0
+
+                    # ── 記錄本局輸贏 ────────────────────────────────────────────
+                    _my_remaining = state.get("my_hand_count", -1)
+                    _enemy_remaining: list[int] = []
+                    for _ep in state.get("enemy_profiles", []):
+                        try:
+                            _enemy_remaining.append(int(_ep.get("remain_text", -1)))
+                        except (ValueError, TypeError):
+                            _enemy_remaining.append(-1)
+
+                    # Placement: 1st if I emptied (0 cards).
+                    # Otherwise count enemies with fewer or equal remaining cards.
+                    if _my_remaining == 0:
+                        _placement = 1
+                    else:
+                        _placement = 1 + sum(
+                            1 for c in _enemy_remaining if c >= 0 and c < _my_remaining
+                        )
+                        # If any enemy has 0, they definitively beat me
+                        _placement = max(_placement,
+                                         1 + sum(1 for c in _enemy_remaining if c == 0))
+
+                    _game_result = {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "session": games_played + 1,
+                        "game_in_session": game_number,
+                        "placement": _placement,
+                        "won": _placement == 1,
+                        "my_remaining": _my_remaining,
+                        "enemy_remaining": _enemy_remaining,
+                    }
+                    game_results.append(_game_result)
+                    # Append to persistent results log
+                    try:
+                        with results_log_path.open("a", encoding="utf-8") as _rf:
+                            _rf.write(json.dumps(_game_result, ensure_ascii=False) + "\n")
+                    except Exception as _e:
+                        logger.log(f"Warning: could not write results log: {_e}")
+
+                    _result_str = "WIN 🎉" if _placement == 1 else f"{_placement}nd/rd/th"
                     logger.log(
-                        f"Scoring phase — game {game_number} in session ended: "
-                        f"my_count={state.get('my_hand_count')} "
-                        f"enemies={[p.get('remain_text') for p in state.get('enemy_profiles', [])]} "
-                        f"— waiting for next game or lobby return"
+                        f"Game {game_number} result: {_result_str} "
+                        f"(placement={_placement}, my_remaining={_my_remaining}, "
+                        f"enemies={_enemy_remaining})"
                     )
-                    score_dialog_dismissed = await maybe_click_score_no(page, logger, action_log)
                     await page.wait_for_timeout(3000)
+                    continue
+
+                # ── 計分過渡期間絕對不出手，主動拒絕再來一局 ──────────────────
+                # in_scoring_wait=True 時計分畫面上的按鈕可能被 is_self_actionable_turn
+                # 誤判為可出牌，導致 agent 點到「再來一局」等按鈕而意外加入下一局。
+                # 必須等到所有玩家都有 ≥10 張牌（in_scoring_wait reset）才恢復行動。
+                # 同時主動偵測並點擊「否/取消」，避免任何重新加入對局的確認視窗
+                # 因使用者或 agent 誤觸而確認。
+                if in_scoring_wait:
+                    now = loop.time()
+                    # 每 3 秒嘗試一次拒絕對話框，避免每個 poll 都觸發（log 連打）
+                    if now - last_decline_time >= 3.0:
+                        declined = await maybe_decline_rematch_dialog(page)
+                        if declined:
+                            logger.log("Declined rematch dialog during scoring wait")
+                            last_decline_time = now
+                    await page.wait_for_timeout(IDLE_POLL_MS)
                     continue
 
                 if state.get("change_three_active"):
@@ -2755,7 +2582,28 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                         await page.wait_for_timeout(3000)
                         continue
 
-                decision = agent.decide(observation)
+                # ── Forced pass after consecutive play failures ────────────────
+                # If play_not_confirmed fired ≥ 2 times in a row (regardless of
+                # which card was tried), the game state is likely diverged or the
+                # game is near-over. Override the ML decision with a pass to
+                # unstick the loop rather than flailing with different cards.
+                if play_fail_count >= 2:
+                    pass_action = next(
+                        (a for a in observation.legal_actions if a.action == "pass"),
+                        None,
+                    )
+                    if pass_action is not None:
+                        logger.log(
+                            f"play_fail_count={play_fail_count} → forcing pass to unstick"
+                        )
+                        from big2_vision_agent.agent_schema import AgentDecision as _AD
+                        decision = _AD(action="pass", note="forced_pass:play_fail")
+                        play_fail_count = 0
+                    else:
+                        # No pass available (我方有控制權且必須出牌) → let ML decide
+                        decision = agent.decide(observation)
+                else:
+                    decision = agent.decide(observation)
                 if decision is None:
                     logger.log("Agent returned no decision; waiting")
                     await page.wait_for_timeout(IDLE_POLL_MS)
@@ -2787,29 +2635,33 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     json.dumps(decision.model_dump(), ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+                _note_str = f" | ML: {decision.note}" if decision.note else ""
                 logger.log(
-                    f"Agent decision: action={decision.action}, cards={decision.card_codes}, combo={decision.combo_type} executor={executor}"
+                    f"Agent decision: action={decision.action}, cards={decision.card_codes}, combo={decision.combo_type} executor={executor}{_note_str}"
                 )
                 if executor == "packet":
                     result = await execute_packet_decision(page, state, decision)
                 else:
                     result = await execute_agent_decision(page, state, decision)
-                logger.log(f"Executor result: ok={result.get('ok')} reason={result.get('reason')}")
-                step_name = "agent_decision"
-                if result.get("reason") == "state_changed_before_send" and result.get("sent") is False:
-                    step_name = "agent_decision_skipped"
                 action_log.append(
                     {
-                        "step": step_name,
+                        "step": "agent_decision",
                         "observation": observation.model_dump(),
                         "decision": decision.model_dump(),
                         "result": result,
                     }
                 )
+                logger.log(f"Executor result: ok={result.get('ok')} reason={result.get('reason')}")
                 if result.get("ok"):
                     last_failed_signature = None
                     skip_count = 0
-                elif result.get("reason") in {"selection_mismatch", "play_not_confirmed", "play_confirmation_timeout"}:
+                    play_fail_count = 0
+                elif result.get("reason") == "play_not_confirmed":
+                    play_fail_count += 1
+                    if decision_signature != last_failed_signature:
+                        skip_count = 0
+                    last_failed_signature = decision_signature
+                elif result.get("reason") == "selection_mismatch":
                     if decision_signature != last_failed_signature:
                         skip_count = 0
                     last_failed_signature = decision_signature
@@ -2860,6 +2712,9 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
             logger.log(f"Saved training summary: {training_summary_path}")
             logger.log(f"Saved autoplay-agent artifacts to {output_dir}")
             print(f"Saved autoplay-agent artifacts to: {output_dir}")
+            # 關閉長駐 wrapper process
+            if hasattr(agent, "close"):
+                agent.close()
 
 
 async def run_lobby_wait(settings: Settings) -> None:

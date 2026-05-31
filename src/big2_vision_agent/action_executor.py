@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from big2_vision_agent.agent_schema import AgentActionOption, AgentDecision
-from big2_vision_agent.browser.actions import click_design_point, read_big2_game_state, toggle_my_card_by_sprite, ws_send_raw
+from big2_vision_agent.browser.actions import click_design_point, deselect_all_selected_cards, read_big2_game_state, toggle_my_card_by_sprite, ws_send_raw
 
 WS_SEND_TARGET_CODE = "9"
 PACKET_CONFIRM_DELAYS_MS = (350, 500, 700, 900, 1200)
@@ -13,6 +13,7 @@ COMBO_BUTTON_KEYS = {
     "straight": "straight",
     "full_house": "full_house",
     "four_of_a_kind": "four_kind",
+    "four_of_kind": "four_kind",   # wrapper returns this spelling
     "straight_flush": "straight_flush",
 }
 
@@ -119,26 +120,23 @@ async def _clear_selected_cards(page, state: dict) -> dict:
     if state.get("my_selected_count", 0) <= 0:
         return state
 
-    cancel_button = state.get("action_buttons", {}).get("cancel", {})
+    # Primary path: call setSelect(false) on all selected cards via Cocos API.
+    # This is the only reliable deselection path — toggle_my_card_by_sprite
+    # calls setSelect(true) and cannot deselect; pixel clicks are unreliable on
+    # overlapping cards (~70% overlap).
+    await deselect_all_selected_cards(page)
+    refreshed = await read_big2_game_state(page)
+    if refreshed.get("my_selected_count", 0) == 0:
+        return refreshed
+
+    # Fallback: cancel button if Cocos API deselect didn't fully clear.
+    cancel_button = refreshed.get("action_buttons", {}).get("cancel", {})
     center = cancel_button.get("center")
     if cancel_button.get("active") and center:
         await click_design_point(page, center["x"], center["y"])
         refreshed = await read_big2_game_state(page)
-        if refreshed.get("my_selected_count", 0) == 0:
-            return refreshed
-        state = refreshed
 
-    for index, card in enumerate(state.get("my_cards", [])):
-        if not card.get("selected"):
-            continue
-        points = _card_click_points(state.get("my_cards", []), index)
-        click_point = points[0] if points else card.get("center")
-        if not click_point:
-            continue
-        await click_design_point(page, click_point["x"], click_point["y"])
-        state = await read_big2_game_state(page)
-
-    return state
+    return refreshed
 
 
 def _selected_card_codes(state: dict) -> list[str]:
@@ -345,18 +343,22 @@ async def execute_agent_decision(
     after_play = await read_big2_game_state(page)
     before_count = state.get("my_hand_count")
     after_count = after_play.get("my_hand_count")
-    turn_changed = after_play.get("turn") != state.get("turn")
+    # Absolute check: did the turn leave "self"?  More reliable than comparing
+    # against the stale `state` snapshot which may predate an auto-win event.
+    turn_left_self = after_play.get("turn") != "self"
     hand_decreased = (
         isinstance(before_count, int)
         and isinstance(after_count, int)
         and after_count < before_count
     )
-    # Retry verification once if neither hand nor turn appears to have changed yet.
-    if not hand_decreased and not turn_changed:
-        await page.wait_for_timeout(800)
+    # Retry up to 2 more times before giving up (server can take ~3 s to respond).
+    for _extra_wait in (800, 1500):
+        if hand_decreased or turn_left_self:
+            break
+        await page.wait_for_timeout(_extra_wait)
         after_play = await read_big2_game_state(page)
         after_count = after_play.get("my_hand_count")
-        turn_changed = after_play.get("turn") != state.get("turn")
+        turn_left_self = after_play.get("turn") != "self"
         hand_decreased = (
             isinstance(before_count, int)
             and isinstance(after_count, int)
@@ -367,7 +369,7 @@ async def execute_agent_decision(
         system_messages.get(key)
         for key in ("card_type_error", "no_bigger_card", "cant_lock")
     )
-    ok = bool(hand_decreased or (turn_changed and not blocked_by_error))
+    ok = bool(hand_decreased or (turn_left_self and not blocked_by_error))
     return {
         "ok": ok,
         "action": "play",
@@ -424,11 +426,25 @@ async def execute_packet_decision(
             "confirmation_states": confirmation_states,
         }
 
+    # Pre-execution check: MCTS takes ~1 s; auto-win or one-card-rule enforcement
+    # may have already played cards for us during that time.  If the turn has
+    # already left "self" before we even send, there is nothing to do — return
+    # ok=True so the caller doesn't retry or force-pass unnecessarily.
+    pre_state = await read_big2_game_state(page)
+    if pre_state.get("turn") != "self":
+        return {
+            "ok": True,
+            "action": "play",
+            "card_codes": decision.card_codes,
+            "reason": None,
+            "note": "auto_advanced_before_send",
+            "state": pre_state,
+        }
+
     cards_blob = "".join(decision.card_codes)
     message = f"send {WS_SEND_TARGET_CODE} {cards_blob}"
-    preflight = await read_big2_game_state(page)
-    confirmation_states = [_compact_packet_confirmation_state(preflight, decision)]
-    if not _is_self_actionable_turn(preflight):
+    confirmation_states = [_compact_packet_confirmation_state(pre_state, decision)]
+    if not _is_self_actionable_turn(pre_state):
         return {
             "ok": False,
             "sent": False,
@@ -436,8 +452,8 @@ async def execute_packet_decision(
             "action": "play",
             "card_codes": decision.card_codes,
             "ws_message": message,
-            "state": preflight,
-            "state_before": preflight,
+            "state": pre_state,
+            "state_before": pre_state,
             "confirmation_states": confirmation_states,
         }
     ok = await ws_send_raw(page, message)
@@ -450,13 +466,13 @@ async def execute_packet_decision(
             "card_codes": decision.card_codes,
         }
 
-    after = preflight
+    after = pre_state
     rejection_reason: str | None = None
     for delay_ms in PACKET_CONFIRM_DELAYS_MS:
         await page.wait_for_timeout(delay_ms)
         after = await read_big2_game_state(page)
         confirmation_states.append(_compact_packet_confirmation_state(after, decision))
-        if _packet_play_confirmed(preflight, after, decision):
+        if _packet_play_confirmed(pre_state, after, decision):
             return {
                 "ok": True,
                 "sent": True,
@@ -465,10 +481,10 @@ async def execute_packet_decision(
                 "ws_message": message,
                 "reason": None,
                 "state": after,
-                "state_before": preflight,
+                "state_before": pre_state,
                 "confirmation_states": confirmation_states,
             }
-        rejection_reason = _packet_rejection_reason(preflight, after)
+        rejection_reason = _packet_rejection_reason(pre_state, after)
         if rejection_reason:
             break
     return {
@@ -479,6 +495,6 @@ async def execute_packet_decision(
         "ws_message": message,
         "reason": rejection_reason or "play_confirmation_timeout",
         "state": after,
-        "state_before": preflight,
+        "state_before": pre_state,
         "confirmation_states": confirmation_states,
     }

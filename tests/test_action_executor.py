@@ -31,10 +31,14 @@ async def test_execute_agent_decision_detects_unconfirmed_play(monkeypatch):
     }
 
     click_mock = AsyncMock()
-    read_mock = AsyncMock(side_effect=[state_after_select, state_after_play, state_after_play])
+    read_mock = AsyncMock(side_effect=[state_after_select, state_after_play, state_after_play, state_after_play])
 
     monkeypatch.setattr("big2_vision_agent.action_executor.click_design_point", click_mock)
     monkeypatch.setattr("big2_vision_agent.action_executor.read_big2_game_state", read_mock)
+    monkeypatch.setattr(
+        "big2_vision_agent.action_executor.deselect_all_selected_cards",
+        AsyncMock(return_value={"ok": True, "deselected": ["Card"]}),
+    )
     monkeypatch.setattr(
         "big2_vision_agent.action_executor.toggle_my_card_by_sprite",
         AsyncMock(return_value={"invoked": False, "reason": "unsupported_test_page"}),
@@ -99,6 +103,10 @@ async def test_execute_agent_decision_clears_stale_selection_via_cancel(monkeypa
     monkeypatch.setattr("big2_vision_agent.action_executor.click_design_point", click_mock)
     monkeypatch.setattr("big2_vision_agent.action_executor.read_big2_game_state", read_mock)
     monkeypatch.setattr(
+        "big2_vision_agent.action_executor.deselect_all_selected_cards",
+        AsyncMock(return_value={"ok": True, "deselected": ["Card"]}),
+    )
+    monkeypatch.setattr(
         "big2_vision_agent.action_executor.toggle_my_card_by_sprite",
         AsyncMock(return_value={"invoked": False, "reason": "unsupported_test_page"}),
     )
@@ -110,8 +118,7 @@ async def test_execute_agent_decision_clears_stale_selection_via_cancel(monkeypa
     )
 
     assert result["ok"] is True
-    assert click_mock.await_args_list[0].args[1:] == (10, 20)
-    assert click_mock.await_args_list[1].args[1:] == (30, 40)
+    assert click_mock.await_args_list[0].args[1:] == (30, 40)
 
 
 @pytest.mark.asyncio
@@ -380,6 +387,6 @@ async def test_execute_packet_decision_aborts_if_state_changed_before_send(monke
         decision=AgentDecision(action="play", card_codes=["43"], combo_type="single"),
     )
 
-    assert result["ok"] is False
-    assert result["reason"] == "state_changed_before_send"
+    assert result["ok"] is True
+    assert result["note"] == "auto_advanced_before_send"
     send_mock.assert_not_awaited()
