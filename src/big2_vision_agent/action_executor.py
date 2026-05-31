@@ -260,18 +260,20 @@ async def execute_agent_decision(
     after_play = await read_big2_game_state(page)
     before_count = state.get("my_hand_count")
     after_count = after_play.get("my_hand_count")
-    turn_changed = after_play.get("turn") != state.get("turn")
+    # Absolute check: did the turn leave "self"?  More reliable than comparing
+    # against the stale `state` snapshot which may predate an auto-win event.
+    turn_left_self = after_play.get("turn") != "self"
     hand_decreased = (
         isinstance(before_count, int)
         and isinstance(after_count, int)
         and after_count < before_count
     )
     # Retry verification once if neither hand nor turn appears to have changed yet.
-    if not hand_decreased and not turn_changed:
+    if not hand_decreased and not turn_left_self:
         await page.wait_for_timeout(800)
         after_play = await read_big2_game_state(page)
         after_count = after_play.get("my_hand_count")
-        turn_changed = after_play.get("turn") != state.get("turn")
+        turn_left_self = after_play.get("turn") != "self"
         hand_decreased = (
             isinstance(before_count, int)
             and isinstance(after_count, int)
@@ -282,7 +284,7 @@ async def execute_agent_decision(
         system_messages.get(key)
         for key in ("card_type_error", "no_bigger_card", "cant_lock")
     )
-    ok = bool(hand_decreased or (turn_changed and not blocked_by_error))
+    ok = bool(hand_decreased or (turn_left_self and not blocked_by_error))
     return {
         "ok": ok,
         "action": "play",
@@ -310,17 +312,35 @@ async def execute_packet_decision(
             return {"ok": False, "reason": "ws_unavailable", "action": "pass"}
         await page.wait_for_timeout(800)
         after = await read_big2_game_state(page)
-        turn_changed = after.get("turn") != state.get("turn")
-        if not turn_changed:
+        turn_left_self = after.get("turn") != "self"
+        if not turn_left_self:
             await page.wait_for_timeout(800)
             after = await read_big2_game_state(page)
-            turn_changed = after.get("turn") != state.get("turn")
+            turn_left_self = after.get("turn") != "self"
         return {
-            "ok": turn_changed,
+            "ok": turn_left_self,
             "action": "pass",
-            "reason": None if turn_changed else "pass_not_confirmed",
+            "reason": None if turn_left_self else "pass_not_confirmed",
             "state": after,
         }
+
+    # Pre-execution check: MCTS takes ~1 s; auto-win or one-card-rule enforcement
+    # may have already played cards for us during that time.  If the turn has
+    # already left "self" before we even send, there is nothing to do — return
+    # ok=True so the caller doesn't retry or force-pass unnecessarily.
+    pre_state = await read_big2_game_state(page)
+    if pre_state.get("turn") != "self":
+        return {
+            "ok": True,
+            "action": "play",
+            "card_codes": decision.card_codes,
+            "reason": None,
+            "note": "auto_advanced_before_send",
+            "state": pre_state,
+        }
+    # Use the freshly read count as the reference so that any auto-play that
+    # already happened (and reduced our hand) is accounted for.
+    before_count = pre_state.get("my_hand_count")
 
     cards_blob = "".join(decision.card_codes)
     message = f"send {WS_SEND_TARGET_CODE} {cards_blob}"
@@ -335,19 +355,21 @@ async def execute_packet_decision(
 
     await page.wait_for_timeout(800)
     after = await read_big2_game_state(page)
-    before_count = state.get("my_hand_count")
     after_count = after.get("my_hand_count")
-    turn_changed = after.get("turn") != state.get("turn")
+    # Use an absolute check ("turn left self") instead of a relative comparison
+    # against the stale `state` snapshot.  This correctly handles auto-win and
+    # one-card-rule auto-play where the turn moves on without our explicit card.
+    turn_left_self = after.get("turn") != "self"
     hand_decreased = (
         isinstance(before_count, int)
         and isinstance(after_count, int)
         and after_count < before_count
     )
-    if not hand_decreased and not turn_changed:
+    if not hand_decreased and not turn_left_self:
         await page.wait_for_timeout(800)
         after = await read_big2_game_state(page)
         after_count = after.get("my_hand_count")
-        turn_changed = after.get("turn") != state.get("turn")
+        turn_left_self = after.get("turn") != "self"
         hand_decreased = (
             isinstance(before_count, int)
             and isinstance(after_count, int)
@@ -358,7 +380,7 @@ async def execute_packet_decision(
         system_messages.get(key)
         for key in ("card_type_error", "no_bigger_card", "cant_lock")
     )
-    play_ok = bool(hand_decreased or (turn_changed and not blocked_by_error))
+    play_ok = bool(hand_decreased or (turn_left_self and not blocked_by_error))
     return {
         "ok": play_ok,
         "action": "play",
